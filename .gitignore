@@ -1,0 +1,25 @@
+# --- Gradle / Android 构建产物 ---
+.gradle/
+**/build/
+local.properties
+.idea/
+*.iml
+.DS_Store
+captures/
+.externalNativeBuild/
+.cxx/
+
+# --- 安装包与临时产物 ---
+dist/
+*.apk
+*.aab
+*.ap_
+*.keystore
+*.jks
+
+# --- 超大模型文件（238MB，超过 GitHub 单文件 100MB 上限）---
+# 用 scripts/fetch_models.sh 下载并校验字节数后再构建
+app/src/main/assets/models/asr/paraformer/model.int8.onnx
+
+# --- Agent 工作区（本地记忆与任务日志，不入公开仓库）---
+.workbuddy/

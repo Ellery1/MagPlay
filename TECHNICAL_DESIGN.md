@@ -1,6 +1,6 @@
 # MagPlay（磁力播） - 技术设计文档
 
-> 版本：v0.1 | 日期：2026-07-23 | 状态：初稿
+> 版本：v0.4 | 日期：2026-07-23 | 状态：评审稿（技术矛盾已修正，迅雷导入方案待产品决策）
 
 ---
 
@@ -71,7 +71,7 @@
 >
 > **libtorrent**：BitTorrent 领域最成熟的 C++ 库，支持 DHT 网络（不依赖 Tracker）、选择性下载（仅下载用户勾选的文件）、TCP/uTP 传输。通过 JNI 包装为 Kotlin 可调用的接口。
 >
-> **sherpa-onnx**：基于 ONNX Runtime 的语音识别框架，同时支持 Whisper（高精度，适合英文）和 Paraformer（中文友好）模型，提供流式识别 API（音频边采集边输出文本），延迟可控。
+> **sherpa-onnx**：基于 ONNX Runtime 的语音识别框架。需注意推理模式差异：**Paraformer / SenseVoice 支持流式识别**（边采集边输出，可满足 PRD 的端到端 ≤1s）；**Whisper 是非流式模型**（需凑齐整段音频再输出），不能用于 5.3.5 的流式管线。因此 7.4 内存预算中「INT8 Whisper small」与 5.3.5「流式 ASR」存在矛盾，首版应选用流式中文模型（Paraformer 或 SenseVoice），Whisper 仅可作为后续离线/非流式场景备选。
 >
 > **CTranslate2 + Opus-MT**：CTranslate2 是专为 Transformer 模型优化的推理引擎，支持 INT8 量化，在移动端推理速度快。Opus-MT 提供预训练的英→中翻译模型，模型体积小（~70MB）。
 
@@ -246,13 +246,15 @@ object DownloadEngine {
 
 #### 5.1.3 并发控制
 
-- libtorrent Session 内部管理并发连接，Kotlin 侧维护一个任务队列（`Channel<TaskHandle>`）。
-- 同时 `active_downloads=3`，通过 libtorrent 的 `set_max_uploads/downloads` 或 Kotlin 层控制任务暂停/恢复实现。
+- libtorrent Session 内部管理并发连接，libtorrent 的 `settings_pack::active_downloads = 3` 控制最多 3 个任务同时下载。
+- Kotlin 侧维护一个**业务任务队列**（Room `download_tasks` 表，`status=PENDING` 按 `created_at` 排序），仅负责「有任务完成 → 从队列取下一个 → `resume()`」，不重复实现调度逻辑。
+- 修正：原表述 `set_max_uploads/downloads` 不是 libtorrent API。上传限速用 `settings_pack::upload_rate_limit`，连接数用 `connections_limit`；并发任务数由 `active_downloads` 控制。两者职责不同，不可混用。
 
 #### 5.1.4 后台下载
 
 - 使用 `ForegroundService` + 通知栏常驻通知，确保下载不被系统杀死。
-- Service 内持有 libtorrent Session 单例，App Activity 销毁不影响下载。
+- Service 内持有 libtorrent Session 单例，与 App **同进程**（不配置 `android:process`），保证 6.1 中的 Kotlin Flow 可直接从 Service 送达 ViewModel；跨进程则 Flow 不可传递，需改为 Binder/AIDL 回调。
+- Android 14+（targetSdk 35）必须声明前台服务类型：清单中添加 `<uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>` 及 `<service ... android:foregroundServiceType="dataSync"/>`，否则启动即抛 `SecurityException`。
 
 ### 5.2 播放模块
 
@@ -440,8 +442,11 @@ suspend fun importFile(
 
 #### 5.4.3 路径访问
 
-- Android 10+ 使用 Scoped Storage，通过 `MediaStore` API 读取公共目录文件。
-- 对于 `/Android/data/` 下的其他应用目录，需使用 SAF (`ACTION_OPEN_DOCUMENT_TREE`) 引导用户授权。首次使用时弹出系统文件夹选择器，引导用户选择对应目录授权。
+- Android 10+ 使用 Scoped Storage，通过 `MediaStore` API 读取公共目录文件（`/Download/`、`/xunlei/`、`/ThunderDownload/`）。
+- **技术结论（已查证 Android 11+/API 30+ 分区存储规则）**：迅雷默认下载目录 `/Android/data/com.xunlei.downloadprovider/` 属于其他应用的专属目录，第三方应用**无法通过任何常规 API 读取**——MediaStore 不索引、`ACTION_OPEN_DOCUMENT(_TREE)` 明确禁止选择 `Android/data/`、`MANAGE_EXTERNAL_STORAGE`（所有文件访问权限）也明确排除其他 app-specific 目录。系统文件管理器可读是因其系统签名特权，普通应用不具备。
+- **因此**：SAF 授权方案对 `/Android/data/` **不成立**，原设计此处描述有误。可行路径为引导用户将迅雷下载目录改到公共目录，或利用迅雷自带的导出功能转存到公共目录后由 MediaStore 扫描（详见 PRD F4.1 待决策项）。
+- 仅在用户手动把迅雷目录改到公共分区后，才可用 SAF/MediaStore 读取；此时不应再出现「无权限」状态标注。
+- **存量文件迁移（PC 侧 / 用户自助，非 App 能力）**：`adb shell` 以 `shell` uid 走 FUSE 层，不受 App 层 Scoped Storage / AppOps 限制，对存量文件执行 `adb pull /sdcard/Android/data/com.xunlei.downloadprovider/files/ThunderDownload/` 在多数 Android 11+ 设备可行（同备份游戏存档原理），是存量迁移的唯一实战通道。命令：先 `adb shell ls <具体包路径>` 只读探测，再 `adb pull <包路径> <电脑目录>`，最后 `adb push <电脑目录> /sdcard/Download/ThunderDownload/` 回推公共目录。限制：① 上层 `ls /sdcard/Android/data/` 常被拒，但具体包路径 pull 常可行；② 小米 HyperOS 各版本策略不一，失败可试 USB/MTP 或 Shizuku + 文件管理器；③ 零售机 `adb root` 不可用（仅 userdebug/eng）；④ 回推公共目录后需触发媒体索引，MediaStore 才能扫到；⑤ 需 USB 调试 + 电脑，普通用户门槛高，**仅作为极客自助迁移指南随文档提供，不作为 App 内置功能**。
 
 ### 5.5 设置模块
 
@@ -494,7 +499,7 @@ SurfaceView / TextureView                                (Compose Canvas 叠加)
 Activity onCreate
       │
       ▼
-bindService(DownloadService) ──► DownloadService 独立进程
+bindService(DownloadService) ──► DownloadService（与应用同进程）
       │                                │
       ▼                                ▼
 Flow collect                     libtorrent Session
@@ -526,7 +531,7 @@ unbindService ──► DownloadService 继续运行（Foreground）
 
 - ASR 模型使用 INT8 量化版本，降低推理内存和 CPU 占用。
 - 音频重采样到 16kHz mono 后送入 ASR，减少计算量。
-- 翻译模型使用 CTranslate2 的 INT8 量化 + 批量处理（攒 2-3 句后批量翻译）。
+- 翻译模型使用 CTranslate2 的 INT8 量化 + **逐句即时翻译**。不得攒批处理：每句间隔数秒，攒 2-3 句会直接突破 PRD F3.4/4.1 的翻译延迟 < 500ms、端到端 ≤ 1s 指标。批处理仅可用于离线字幕生成，不适用于实时场景。
 - 关掉字幕时完全释放 native 资源（`release()`），不占用 CPU。
 
 ### 7.4 内存预算（1080p 播放 + 字幕场景）
@@ -540,6 +545,8 @@ unbindService ──► DownloadService 继续运行（Foreground）
 | 其他 | ~50 MB |
 | **合计** | **≈ 400 MB** |
 
+> 该合计正好压在 PRD 4.1 的内存上限（≤400MB）上，没有任何余量，实际机型上 Java 堆、native 分配、ROM 开销叠加后极易超标。建议：1080p 场景改用 Whisper tiny（~75MB）或按需只加载 ASR、不驻留翻译模型，把预算压到 ~320MB；4K 场景 PRD 未设内存指标，需在验收标准中补充或明确降级策略。
+
 ---
 
 ## 8. 安全与隐私
@@ -550,7 +557,8 @@ unbindService ──► DownloadService 继续运行（Foreground）
 |---|---|---|
 | `INTERNET` | P2P 下载、模型下载 | 必须 |
 | `FOREGROUND_SERVICE` | 后台下载 | 必须 |
-| `POST_NOTIFICATIONS` | 下载完成通知 | 必须 |
+| `FOREGROUND_SERVICE_DATA_SYNC` | 前台服务类型声明（Android 14+/API 34+ 强制，targetSdk 35 必需） | 必须 |
+| `POST_NOTIFICATIONS` | 下载完成通知（Android 13+/API 33+ 需运行时申请） | 必须 |
 | `ACCESS_NETWORK_STATE` | 检测网络状态 | 必须 |
 | `WAKE_LOCK` | 后台下载时保持 CPU | 必须 |
 | `RECEIVE_BOOT_COMPLETED` | 开机恢复下载任务 | 可选 |
@@ -559,9 +567,9 @@ unbindService ──► DownloadService 继续运行（Foreground）
 
 ### 8.2 数据隔离
 
-- 所有用户数据（视频、数据库、模型）存储在 `context.filesDir` 和 `context.externalMediaDirs` 下。
+- 所有用户数据（视频、数据库、模型）存储在 `context.filesDir` 和 `context.getExternalFilesDir()`（App 专属外部目录，随卸载删除）下。不使用无归属的 `externalMediaDirs` 公共路径，以匹配 PRD F5.4「其他应用无法访问」的承诺；从公共目录扫描到的迅雷视频以「复制/移动进 App 专属目录」方式纳入管理，不以原路径直接引用。
 - `android:requestLegacyExternalStorage="false"`，遵循 Scoped Storage。
-- 网络通信仅限 DHT/Tracker P2P 协议端口，不发起任何 HTTP 遥测或上报请求。
+- 网络通信分两类且均为「上行下载」性质：DHT/Tracker P2P 协议通信、模型 CDN 的 HTTPS 下载（见 5.3.4）。不发起任何 HTTP 遥测、统计或用户数据上报请求。原表述「仅限 P2P 协议端口」与 5.3.4 的模型 CDN 下载矛盾，此处修正。
 
 ### 8.3 代码层面
 
@@ -643,7 +651,7 @@ x86 和 x86_64 不在支持范围内（PRD 要求仅 ARM/ARM64）。
 
 ### 11.3 字幕模型下载：最大的体验断点
 
-**问题**：用户兴致勃勃打开视频、点字幕按钮，结果弹出一个 150MB 的模型下载，用户可能直接放弃。
+**问题**：用户兴致勃勃打开视频、点字幕按钮，结果弹出一个约 220MB 的模型下载（ASR 150MB + 翻译 70MB，见 7.4），用户可能直接放弃。
 
 **设计决策**：
 - **触发时机前置**：不等到用户点字幕按钮才下载。在视频列表页放置一个常驻的"字幕模型"入口，让用户提前感知并下载。
@@ -700,7 +708,7 @@ x86 和 x86_64 不在支持范围内（PRD 要求仅 ARM/ARM64）。
 
 **设计决策**：
 - 在触发 SAF 之前，先在 App 内显示一个引导卡片，用截图 + 箭头示意用户应该选择哪个文件夹，文案为："请在弹出的系统窗口中，选择以下文件夹以授权访问"。
-- 对于 Android 11+ `/Android/data/` 目录已受保护无法直接通过 SAF 访问的情况，在扫描结果中标注"受系统保护，无法访问"，避免用户认为是 App 的问题。
+- 对于 Android 11+ `/Android/data/` 目录：该目录受系统保护，SAF、MediaStore、所有文件访问权限均无法访问（见 5.4.3）。扫描器应直接跳过该路径，不展示、不标注为「无权限」让用户误以为是 App 故障；改为在扫描页顶部常驻一条引导：教用户到迅雷「我的→设置→下载上传设置→选择存储空间」把下载目录设到公共目录（如 `/Download/`），新文件即可被自动扫描到；存量文件用迅雷自带的「清理缓存和空间→占用详情→勾选→复制到公共目录」导出。
 
 ### 11.9 多文件种子的选择体验
 
@@ -816,3 +824,7 @@ x86 和 x86_64 不在支持范围内（PRD 要求仅 ARM/ARM64）。
 ---
 
 > **文档状态说明**：v0.4，第 11 章精简至 20 个 UX 场景。删除 11.17（列表/网格切换）、11.18（缩略图）、11.23（应用内更新）；11.21 分享入口改为 11.19 打开方式（视频文件关联播放）。
+>
+> **v0.4 技术勘误（已修正）**：① 5.1.3 并发控制改为 `active_downloads` + 业务队列，删除错误 API `set_max_uploads/downloads`；② 5.1.4/6.3 明确 Service 与 App 同进程，Flow 才可跨层传递；③ 8.1 补 `FOREGROUND_SERVICE_DATA_SYNC`（targetSdk 35 必需）及 POST_NOTIFICATIONS 运行时申请；④ 7.3 取消攒句批量翻译，改逐句即时翻译以满足延迟指标；⑤ 8.2 修正「网络通信仅限 P2P」的错误表述；⑥ 5.4.3 更正 SAF 无法访问 `Android/data/` 的技术结论；⑦ 7.4/11.3 修正模型体积与内存预算口径。
+>
+> **待产品决策（未修改，需业务确认）**：PRD F4.1「扫描迅雷私有目录」在 Android 11+ 技术上不可行，建议改为「引导用户将迅雷下载目录设为公共目录 + 导出存量」；第 11 章 11.13–11.20 多个 UX 场景在 PRD 中无对应需求与验收标准，需确认是否纳入本期范围。
