@@ -7,10 +7,17 @@
         android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- 锁屏后继续跑字幕生成：申请电池优化白名单（小米还需在「省电策略」里选无限制） -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!--
+      移动 / 删除别的 App 下载的视频（迅雷、UC 等）。Android 11+ 对这些文件不开放写权限，
+      不授予时每次操作都要弹一次系统确认；授予后移动视频才能一次到位。
+      仅本地个人使用，不上架 Play（该权限受商店政策限制）。
+    -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
     <application
         android:allowBackup="true"
@@ -40,6 +47,17 @@
             android:name=".subtitle.SubtitleGenerationService"
             android:exported="false"
             android:process=":subtitle"
+            android:foregroundServiceType="mediaProcessing" />
+
+        <!--
+            模型对比测试（开发期用，adb 直接拉起）：
+            am start-foreground-service -n com.magplay/.bench.BenchService 加参数 path / sec / models
+            独立进程是为了让 1GB 模型的加载或 native 崩溃都不影响主界面。
+        -->
+        <service
+            android:name=".bench.BenchService"
+            android:exported="true"
+            android:process=":bench"
             android:foregroundServiceType="mediaProcessing" />
 
         <!-- 运行日志导出：把 txt 写到 cache/share 后通过 FileProvider 分享出去 -->

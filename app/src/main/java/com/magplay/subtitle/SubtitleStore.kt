@@ -76,13 +76,42 @@ object SubtitleStore {
      * MediaStore.Files 插入 .srt（非媒体文件），只能退回 App 私有目录。
      * 用 relativePath+文件名 的哈希命名，避免同名不同目录冲突。
      */
-    private fun privateSrtFile(context: Context, video: VideoItem): File {
+    private fun privateSrtFile(context: Context, video: VideoItem): File =
+        privateSrtFile(context, video.relativePath, video.name)
+
+    private fun privateSrtFile(context: Context, relPath: String, name: String): File {
         val dir = File(context.getExternalFilesDir(null), "subtitles")
         if (!dir.exists()) dir.mkdirs()
-        val key = (video.relativePath + "/" + video.name).toByteArray(Charsets.UTF_8)
+        val key = (relPath + "/" + name).toByteArray(Charsets.UTF_8)
         val hash = java.security.MessageDigest.getInstance("MD5")
             .digest(key).joinToString("") { "%02x".format(it) }
         return File(dir, "$hash.srt")
+    }
+
+    /** 私有兜底目录里该视频的字幕文件（不存在返回 null），删除视频时用。 */
+    fun privateSrtFileOrNull(context: Context, video: VideoItem): File? =
+        privateSrtFile(context, video).takeIf { it.exists() }
+
+    /**
+     * 视频移动/改名后，把私有兜底字幕挪到新键位（私有文件名是按 relativePath+文件名 哈希的）。
+     * 公共目录里的字幕走 MediaStore 改 RELATIVE_PATH，不会走到这里。
+     */
+    fun relocatePrivateSrt(
+        context: Context,
+        old: VideoItem,
+        newRelPath: String,
+        newName: String,
+    ) {
+        val src = privateSrtFile(context, old)
+        if (!src.exists()) return
+        val dst = privateSrtFile(context, newRelPath, newName)
+        try {
+            if (dst.absolutePath == src.absolutePath) return
+            dst.writeBytes(src.readBytes())
+            src.delete()
+        } catch (t: Throwable) {
+            android.util.Log.w("SubtitleStore", "relocate private srt failed: ${t.message}")
+        }
     }
 
     /** 读取字幕内容并解析。 */
@@ -106,6 +135,72 @@ object SubtitleStore {
     fun hasUsable(context: Context, video: VideoItem): Boolean {
         val cues = loadCues(context, video) ?: return false
         return SrtFile.isUsable(cues, video.durationMs)
+    }
+
+    /**
+     * 是否已有**由指定引擎**生成的可用字幕。
+     *
+     * 为什么要记引擎：换了更强的模型之后，旧模型生成的字幕在内容校验上是"可用"的，
+     * 会被全量生成直接跳过 —— 结果就是新模型永远用不上。
+     * 没有记录的老字幕（本功能上线前生成的）一律视为需要重做。
+     */
+    fun hasUsableForEngine(context: Context, video: VideoItem, engineId: String): Boolean =
+        hasUsable(context, video) && engineOf(context, video) == engineId
+
+    // ---- 引擎记录（srt_engine.json）----
+
+    private fun engineFile(context: Context): File =
+        File(context.getExternalFilesDir(null), "srt_engine.json")
+
+    private fun engineKey(relativePath: String, name: String): String = "$relativePath|$name"
+
+    private fun readEngineMap(context: Context): MutableMap<String, String> {
+        val f = engineFile(context)
+        if (!f.isFile) return mutableMapOf()
+        return try {
+            val obj = org.json.JSONObject(f.readText(Charsets.UTF_8))
+            val map = mutableMapOf<String, String>()
+            obj.keys().forEach { k -> map[k] = obj.optString(k, "") }
+            map
+        } catch (_: Throwable) {
+            mutableMapOf()
+        }
+    }
+
+    @Synchronized
+    private fun writeEngineMap(context: Context, map: Map<String, String>) {
+        try {
+            val obj = org.json.JSONObject()
+            map.forEach { (k, v) -> obj.put(k, v) }
+            engineFile(context).writeText(obj.toString(), Charsets.UTF_8)
+        } catch (t: Throwable) {
+            android.util.Log.w("SubtitleStore", "write engine map failed: ${t.message}")
+        }
+    }
+
+    fun engineOf(context: Context, video: VideoItem): String? =
+        readEngineMap(context)[engineKey(video.relativePath, video.name)]
+
+    fun recordEngine(context: Context, video: VideoItem, engineId: String) {
+        val map = readEngineMap(context)
+        map[engineKey(video.relativePath, video.name)] = engineId
+        writeEngineMap(context, map)
+    }
+
+    fun forgetEngine(context: Context, video: VideoItem) {
+        val map = readEngineMap(context)
+        if (map.remove(engineKey(video.relativePath, video.name)) != null) {
+            writeEngineMap(context, map)
+        }
+    }
+
+    /** 视频移动/改名后把引擎记录搬到新键位，避免白重做一遍。 */
+    fun rekeyEngine(context: Context, old: VideoItem, newRelPath: String, newName: String) {
+        val map = readEngineMap(context)
+        val oldKey = engineKey(old.relativePath, old.name)
+        val v = map.remove(oldKey) ?: return
+        map[engineKey(newRelPath, newName)] = v
+        writeEngineMap(context, map)
     }
 
     /**

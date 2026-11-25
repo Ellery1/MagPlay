@@ -3,66 +3,75 @@ package com.magplay.subtitle
 import android.content.Context
 import android.util.Log
 import com.k2fsa.sherpa.onnx.FeatureConfig
-import com.k2fsa.sherpa.onnx.OfflineModelConfig
-import com.k2fsa.sherpa.onnx.OfflineParaformerModelConfig
 import com.k2fsa.sherpa.onnx.OfflineRecognizer
 import com.k2fsa.sherpa.onnx.OfflineRecognizerConfig
-import com.k2fsa.sherpa.onnx.SileroVadModelConfig
-import com.k2fsa.sherpa.onnx.Vad
 import com.k2fsa.sherpa.onnx.VadModelConfig
+import com.k2fsa.sherpa.onnx.Vad
+import com.magplay.asr.AsrBackend
+import com.magplay.asr.AsrModelConfigFactory
+import com.magplay.asr.NullAssets
+import com.magplay.asr.AsrModels
 
 /**
- * 离线字幕生成器：VAD 按静音切句 → Paraformer（非流式中文大模型）逐句识别 → SRT。
- * 全程设备端，无网络。模型从 assets 加载。
+ * 离线字幕生成器：VAD 按静音切句 → 指定后端逐句识别 → 加标点 → 按语意切条 → SRT。
+ * 全程设备端，无网络。
  *
- * 内存优化（修复批量生成 OOM）：
- * - 识别模型在 prepare() 中加载一次，整批视频复用；close() 统一释放。
- * - 音频由 AudioDecoder 分块交付，逐块识别，块内时间戳加 offsetMs 还原到全片时间轴。
+ * 三个可变点（都为了准确率）：
+ * 1. **后端可换**：Paraformer / FireRedASR2-CTC / FireRedASR2-AED / Qwen3-ASR，模型从
+ *    `files/models/<id>/` 读，换模型不用重装 APK。
+ * 2. **标点模型**：ct-punc 给无标点输出补标点，同时被 [SubtitleLineBreaker] 当作切句依据。
+ * 3. **音频规整**：80Hz 高通去低频噪声 + 逐段 RMS 归一化。
  *
- * 时间轴正确性（修复长视频时间戳翻倍/倒挂）：
- * - 每个音频块**新建一个 Vad 实例**，用完即 release。
- *   原因：Vad 的 SpeechSegment.start 是"自实例创建以来的累计样本数"，Reset() 不保证
- *   复位该计数；复用实例处理第 k 块时 start 已累计到 k 块开头，再叠加 baseMs 就翻倍，
- *   27 分钟视频会跑出 54 分钟，且 endMs 被块尾夹断后出现 start > end 的倒挂条目。
- *   每块新建实例后，seg.start 必然从 0 起算，与块内偏移语义一致。
- * - 兜底：块内再保证起点单调、终点不早于起点，异常条目直接丢弃。
+ * 时间轴正确性（历史坑，勿改）：
+ * - 每个音频块**新建 Vad 实例**：seg.start 是实例生命周期累计样本数，复用会导致时间轴翻倍。
+ * - 段起点不得早于上一条结束，终点不得越过块尾。
  */
-class OfflineSubtitleGenerator(private val context: Context) {
+class OfflineSubtitleGenerator(
+    private val context: Context,
+    val backend: AsrBackend = AsrBackend.PARAFORMER,
+) {
 
     data class Progress(val stage: String, val percent: Int)
 
     private var vadConfig: VadModelConfig? = null
     private var recognizer: OfflineRecognizer? = null
+    private var highPass: AudioPreprocess.HighPass? = null
 
-    /** 加载模型（较重，整批只调用一次）。线程安全由调用方保证。 */
-    fun prepare() {
-        if (recognizer != null) return
-        vadConfig = VadModelConfig(
-            sileroVadModelConfig = SileroVadModelConfig(
-                model = "models/asr/silero_vad_v5.onnx",
-                threshold = 0.5f,
-                minSilenceDuration = 0.35f,
-                minSpeechDuration = 0.25f,
-                windowSize = 512,
-                maxSpeechDuration = 25f,
-            ),
-            sampleRate = 16000,
-            numThreads = 1,
-        )
+    /** 最近一次 prepare 失败的原因，供 UI / 日志显示。 */
+    var lastError: String? = null
+        private set
 
-        val modelConfig = OfflineModelConfig(
-            paraformer = OfflineParaformerModelConfig(model = "models/asr/paraformer/model.int8.onnx"),
-            tokens = "models/asr/paraformer/tokens.txt",
-            numThreads = 2,
-            modelType = "paraformer",
-        )
-        val recConfig = OfflineRecognizerConfig(
-            featConfig = FeatureConfig(sampleRate = 16000, featureDim = 80),
-            modelConfig = modelConfig,
-            decodingMethod = "greedy_search",
-        )
-        recognizer = OfflineRecognizer(context.assets, recConfig)
-        Log.i(TAG, "models prepared (paraformer); vad is created per chunk")
+    /** 加载模型（较重，整批只调用一次）。失败返回 false 并写 lastError。 */
+    fun prepare(): Boolean {
+        if (recognizer != null) return true
+        lastError = null
+        val model = try {
+            AsrModelConfigFactory.modelConfig(context, backend, AsrModelConfigFactory.BATCH_THREADS)
+        } catch (t: Throwable) {
+            lastError = "模型文件缺失：${t.message}"
+            Log.e(TAG, "build model config failed", t)
+            return false
+        }
+        // 段太长会让 AED/LLM 类模型丢内容，20s 是准确率与效率的平衡点
+        vadConfig = AsrModelConfigFactory.vadConfig(maxSpeechSeconds = 20f)
+        return try {
+            val recConfig = OfflineRecognizerConfig(
+                featConfig = FeatureConfig(sampleRate = 16000, featureDim = 80, dither = 0f),
+                modelConfig = model,
+                decodingMethod = "greedy_search",
+            )
+            // 模型在文件系统上时必须传 null AssetManager，否则 sherpa-onnx 直接 exit 掉进程
+            val am = if (AsrModels.onFileSystem(context, backend)) NullAssets.get() else context.assets
+            recognizer = OfflineRecognizer(am, recConfig)
+            highPass = AudioPreprocess.HighPass()
+            Log.i(TAG, "models prepared: ${backend.id}")
+            true
+        } catch (t: Throwable) {
+            lastError = "模型加载失败：${t.message}"
+            Log.e(TAG, "load recognizer failed", t)
+            recognizer = null
+            false
+        }
     }
 
     fun isPrepared(): Boolean = recognizer != null
@@ -72,14 +81,13 @@ class OfflineSubtitleGenerator(private val context: Context) {
         try { recognizer?.release() } catch (_: Throwable) {}
         recognizer = null
         vadConfig = null
-        Log.i(TAG, "models released")
+        highPass = null
+        Log.i(TAG, "models released (${backend.id})")
     }
 
     /**
      * 识别一个音频块。须先调用 prepare()。
-     * 非挂起：解码回调线程里直接调用，避免为每块切线程。
-     * @param chunk 16kHz mono float 音频块
-     * @param isActive 取消检查（默认一直继续）
+     * @param chunk 16kHz mono float 音频块（会被原地高通滤波）
      * @return 带时间戳（已含 offsetMs）的字幕条目
      */
     fun generate(
@@ -94,6 +102,9 @@ class OfflineSubtitleGenerator(private val context: Context) {
         val baseMs = chunk.offsetMs
         val cues = mutableListOf<SrtCue>()
 
+        // 低频去噪：整块连续处理，状态跨块保留（见 HighPass 注释）
+        highPass?.process(pcm)
+
         // 每块新建：seg.start 从 0 起算，杜绝跨块累计
         val vad = Vad(context.assets, cfg)
         try {
@@ -104,41 +115,46 @@ class OfflineSubtitleGenerator(private val context: Context) {
             val win = FloatArray(window)
 
             fun processSegment(seg: com.k2fsa.sherpa.onnx.SpeechSegment) {
-                val segSamples = seg.samples
-                if (segSamples.isEmpty()) return
+                val raw = seg.samples
+                if (raw.isEmpty()) return
                 val relStart = (seg.start / 16L).coerceIn(0L, totalMs)
-                val speechMs = (segSamples.size / 16L).coerceAtLeast(400L)
-                // 起点不得早于上一条结束（VAD 偶尔吐重叠语段），终点不得越过块尾
+                val speechMs = (raw.size / 16L).coerceAtLeast(400L)
                 val startInChunk = maxOf(relStart, lastEndInChunk)
                 val endInChunk = (startInChunk + speechMs).coerceAtMost(totalMs)
                 if (endInChunk <= startInChunk) return
-                // 注意：必须用无参 createStream()。
-                // sherpa-onnx 的 createStream(hotwords) 重载在基类里是兜底实现，
-                // 非 transducer 模型（paraformer）调用会直接 SHERPA_ONNX_EXIT(-1) 杀进程。
+
                 val stream = rec.createStream()
                 try {
-                    stream.acceptWaveform(segSamples, 16000)
+                    val samples = AudioPreprocess.normalize(raw)
+                    stream.acceptWaveform(samples, 16000)
                     rec.decode(stream)
-                    val text = rec.getResult(stream).text.trim()
-                    if (text.isEmpty()) return
+                    val result = rec.getResult(stream)
+                    val rawText = result.text.trim()
+                    if (rawText.isEmpty()) return
+                    val text = rawText
                     lastEndInChunk = endInChunk
                     segIndex++
-                    cues += SrtCue(
-                        index = cues.size + 1,
-                        startMs = baseMs + startInChunk,
-                        endMs = baseMs + endInChunk,
-                        text = text,
-                    )
+
+                    val absStart = baseMs + startInChunk
+                    val absEnd = baseMs + endInChunk
+                    val timed = timedTokens(result.tokens, result.timestamps)
+                    val parts = SubtitleLineBreaker.split(text, absStart, absEnd, timed)
+                    parts.forEach { (t, range) ->
+                        cues += SrtCue(
+                            index = 0, // 统一在最后重编号
+                            startMs = range.first,
+                            endMs = range.last,
+                            text = t,
+                        )
+                    }
                     val pct = (endInChunk * 100 / totalMs.coerceAtLeast(1)).toInt().coerceIn(0, 100)
                     onProgress(Progress("识别中 $segIndex 句", pct))
-                    Log.d(TAG, "seg $segIndex [${baseMs + startInChunk}-${baseMs + endInChunk}ms] -> $text")
+                    Log.d(TAG, "seg $segIndex [$absStart-$absEnd] -> $text")
                 } finally {
                     stream.release()
                 }
             }
 
-            // sherpa VAD 要求每次 acceptWaveform 严格喂 window_size(512) 个样本。
-            // 复用同一个 512 缓冲，避免每 32ms 分配一次数组（长视频上百万次分配会拖慢并抖动内存）。
             while (offset < pcm.size) {
                 if (!isActive()) break
                 if (offset + window <= pcm.size) {
@@ -165,13 +181,23 @@ class OfflineSubtitleGenerator(private val context: Context) {
                 vad.pop()
             }
             onProgress(Progress("块完成", 100))
-            return cues
+            return cues.mapIndexed { i, c -> c.copy(index = i + 1) }
         } finally {
             try { vad.release() } catch (_: Throwable) {}
         }
     }
 
+    /** 组装词级时间戳。token 与 timestamp 对不上（长度不一致）时返回空。 */
+    private fun timedTokens(tokens: Array<String>?, ts: FloatArray?): List<Pair<String, Float>> {
+        if (tokens == null || ts == null) return emptyList()
+        if (tokens.isEmpty() || tokens.size != ts.size) return emptyList()
+        return tokens.zip(ts.toList())
+    }
+
     companion object {
         private const val TAG = "OfflineSubtitle"
+
+        /** 批量生成是独占场景，多给几个线程换速度。 */
+        private const val THREADS = 4
     }
 }

@@ -60,4 +60,34 @@ object VideoScanner {
         }
         return result
     }
+
+    /**
+     * 按 id 取单个视频。
+     *
+     * 单条字幕生成不能走 [scan] 再筛（那样等于扫全量），直接带 `_ID=?` 查询，
+     * 一次 cursor 就够，几十毫秒返回。
+     */
+    fun findById(context: Context, id: Long): VideoItem? {
+        val cursor = context.contentResolver.query(
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+            projection,
+            "${MediaStore.Video.Media._ID}=?",
+            arrayOf(id.toString()),
+            null,
+        ) ?: return null
+        cursor.use { c ->
+            if (!c.moveToFirst()) return null
+            return VideoItem(
+                id = c.getLong(c.getColumnIndexOrThrow(MediaStore.Video.Media._ID)),
+                uri = ContentUris.withAppendedId(
+                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id,
+                ),
+                name = c.getString(c.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)) ?: "未知文件",
+                size = c.getLong(c.getColumnIndexOrThrow(MediaStore.Video.Media.SIZE)),
+                durationMs = c.getLong(c.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)),
+                relativePath = c.getString(c.getColumnIndexOrThrow(MediaStore.Video.Media.RELATIVE_PATH)) ?: "",
+                dateAddedSec = c.getLong(c.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_ADDED)),
+            )
+        }
+    }
 }

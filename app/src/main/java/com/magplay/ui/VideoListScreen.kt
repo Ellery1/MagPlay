@@ -1,13 +1,21 @@
 package com.magplay.ui
 
+import android.app.Activity
+import android.os.SystemClock
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.IntentSenderRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -20,6 +28,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -34,11 +43,13 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Article
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.DriveFileMove
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Subtitles
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
@@ -55,30 +66,55 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import com.magplay.data.AppLog
+import com.magplay.data.FileOpResult
+import com.magplay.asr.AsrModels
 import com.magplay.data.PowerGuard
 import com.magplay.data.ThumbnailLoader
+import com.magplay.data.VideoFiles
 import com.magplay.data.VideoItem
 import com.magplay.data.VideoRename
+import com.magplay.data.VideoScanner
+import com.magplay.subtitle.GenAttempts
+import com.magplay.subtitle.AsrSettings
 import com.magplay.subtitle.SubtitleGenerationService
+import com.magplay.subtitle.SubtitleStore
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.runtime.rememberCoroutineScope
+import kotlin.math.roundToInt
 
 enum class SortKey(val label: String) {
     NAME("名称"), DATE("时间"), SIZE("大小"), DURATION("时长"),
@@ -106,6 +142,220 @@ fun VideoListScreen(
     var pendingGenForce by remember { mutableStateOf<Boolean?>(null) }
     val searching = query.isNotBlank()
 
+    // ---- 长按拖拽移动 ----
+    val haptics = LocalHapticFeedback.current
+    val density = LocalDensity.current
+    // 触发"回上一级"的顶部热区。原来是 72dp——正好盖住第一个文件夹卡片，
+    // 想拖到第一个文件夹时经常被误判成回上级。收到 24dp（贴着列表最顶端），
+    // 再加 0.7s 停留确认，才真正改目录。
+    val topZonePx = with(density) { 24.dp.toPx() }
+    /** 按住视频往右划多远算"呼出菜单"。32dp 大约 4mm，比长按快得多，也不容易误触。 */
+    val menuSwipePx = with(density) { 32.dp.toPx() }
+    var dragVideo by remember { mutableStateOf<VideoItem?>(null) }
+    var dragMoved by remember { mutableStateOf(false) }
+    var dragPos by remember { mutableStateOf(Offset.Zero) }   // 窗口坐标
+    var hoverDir by remember { mutableStateOf<String?>(null) }
+    var jumpHint by remember { mutableStateOf(false) }
+    var topArmed by remember { mutableStateOf(true) }
+    var topJob by remember { mutableStateOf<Job?>(null) }
+    /** 本次拖拽是否已经"吸附"回过上一级：松手时若没落到文件夹卡片上，就默认移入该目录。 */
+    var jumpedUp by remember { mutableStateOf(false) }
+    val dirRects = remember { mutableMapOf<String, Rect>() }
+    /** 视频行在窗口中的位置，按键 id 索引；全屏手势层靠它判断按到了哪一项。 */
+    val videoRects = remember { mutableMapOf<Long, Rect>() }
+    val videosState = rememberUpdatedState(videos)
+    var listTopInWindow by remember { mutableStateOf(0f) }
+    var rootOrigin by remember { mutableStateOf(Offset.Zero) }
+
+    // ---- 长按菜单 / 删除 / 系统授权 ----
+    var actionTarget by remember { mutableStateOf<VideoItem?>(null) }
+    var deleteTarget by remember { mutableStateOf<VideoItem?>(null) }
+    var pendingOp by remember { mutableStateOf<PendingFileOp?>(null) }
+    var genPlanText by remember { mutableStateOf<String?>(null) }
+
+    // 系统授权弹窗（"允许 MagPlay 修改/删除此文件？"）回来后重试一次
+    val permLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult(),
+    ) { res ->
+        val op = pendingOp
+        pendingOp = null
+        if (op != null) {
+            if (res.resultCode != Activity.RESULT_OK) {
+                Toast.makeText(context, "未授权，操作已取消", Toast.LENGTH_SHORT).show()
+            } else {
+                val retry = if (op.targetDir == null) {
+                    VideoFiles.delete(context, op.video)
+                } else {
+                    VideoFiles.move(context, op.video, op.targetDir)
+                }
+                when (retry) {
+                    is FileOpResult.Ok -> {
+                        Toast.makeText(context, retry.message, Toast.LENGTH_SHORT).show()
+                        scope.launch { onRefresh() }
+                    }
+                    is FileOpResult.Failed -> {
+                        Toast.makeText(context, retry.message, Toast.LENGTH_SHORT).show()
+                    }
+                    is FileOpResult.NeedPermission -> {
+                        Toast.makeText(context, "系统仍未放行该文件", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
+    }
+
+    /** 视频是别的 App 建的，先拉起系统授权弹窗，同意后自动重试。 */
+    fun requestPermission(video: VideoItem, targetDir: String?, uris: List<android.net.Uri>) {
+        pendingOp = PendingFileOp(video, targetDir)
+        val sender = runCatching {
+            val resolver = context.contentResolver
+            if (targetDir == null) {
+                android.provider.MediaStore.createDeleteRequest(resolver, uris).intentSender
+            } else {
+                android.provider.MediaStore.createWriteRequest(resolver, uris).intentSender
+            }
+        }.getOrNull()
+        if (sender == null) {
+            pendingOp = null
+            Toast.makeText(context, "当前系统不支持逐次授权，请授予「所有文件访问权限」", Toast.LENGTH_LONG).show()
+        } else {
+            permLauncher.launch(IntentSenderRequest.Builder(sender).build())
+        }
+    }
+
+    fun doMove(video: VideoItem, targetDir: String) {
+        if (video.relativePath.trimEnd('/') == targetDir.trimEnd('/')) {
+            // 拖到"它已经所在的目录"是无效操作，但不能静默返回：根目录会把顶层目录里的
+            // 视频也列出来（见 shownVideos 的父级判断），很容易拖了个寂寞还以为手势坏了。
+            Toast.makeText(
+                context,
+                "它已经在 ${targetDir.trimEnd('/')} 里了，不需要移动",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
+        when (val r = VideoFiles.move(context, video, targetDir)) {
+            is FileOpResult.Ok -> {
+                Toast.makeText(context, r.message, Toast.LENGTH_SHORT).show()
+                scope.launch { onRefresh() }
+            }
+            is FileOpResult.NeedPermission -> requestPermission(video, targetDir, r.uris)
+            is FileOpResult.Failed -> Toast.makeText(context, r.message, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun doDelete(video: VideoItem) {
+        when (val r = VideoFiles.delete(context, video)) {
+            is FileOpResult.Ok -> {
+                Toast.makeText(context, r.message, Toast.LENGTH_SHORT).show()
+                scope.launch { onRefresh() }
+            }
+            is FileOpResult.NeedPermission -> requestPermission(video, null, r.uris)
+            is FileOpResult.Failed -> Toast.makeText(context, r.message, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /** 拖动中：更新位置、顶部吸附回上一级、命中文件夹高亮。 */
+    fun onDragPosition(p: Offset) {
+        dragPos = p
+        val inTop = p.y < listTopInWindow + topZonePx
+        if (inTop != jumpHint) jumpHint = inTop
+        if (inTop) {
+            hoverDir = null
+            // 停留确认：手指在顶部热区里停住 0.7s 才回上一级。
+            // 只是路过顶部（去够第一个文件夹卡片）不会触发。
+            if (topArmed && topJob == null && currentDir.isNotEmpty() && query.isBlank()) {
+                topJob = scope.launch {
+                    delay(TOP_DWELL_MS)
+                    topJob = null
+                    // 到点了还要确认手指仍在顶部、且拖拽没有结束
+                    if (dragVideo != null && dragPos.y < listTopInWindow + topZonePx &&
+                        currentDir.isNotEmpty()
+                    ) {
+                        topArmed = false
+                        jumpedUp = true
+                        dirRects.clear()
+                        hoverDir = null
+                        currentDir = currentDir.substringBeforeLast("/", "")
+                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                    }
+                }
+            }
+        } else {
+            topJob?.cancel()
+            topJob = null
+            if (!topArmed) topArmed = true
+            hoverDir = dirRects.entries.firstOrNull { it.value.contains(p) }?.key
+        }
+    }
+
+    fun resetDrag() {
+        topJob?.cancel()
+        topJob = null
+        dragVideo = null
+        dragMoved = false
+        hoverDir = null
+        jumpHint = false
+        topArmed = true
+        jumpedUp = false
+    }
+
+    /**
+     * 松手：落在文件夹上就移进去；已经吸附回过上一级、又没落到任何卡片上，就移进上一级目录。
+     *
+     * 后半条是关键：拖到顶部回上级后，列表内容整个换了一套，用户往往直接松手（或落在视频行/空白处），
+     * 旧逻辑此时 target 为 null，静默什么都不做——表现就是"回到上级了但文件没动"。
+     */
+    fun finishDrag() {
+        val v = dragVideo
+        val moved = dragMoved
+        val hit = hoverDir
+        val jumped = jumpedUp
+        resetDrag()
+        if (v == null || !moved) return
+        val target = when {
+            hit != null && query.isBlank() ->
+                if (currentDir.isEmpty()) "$hit/" else "$currentDir/$hit/"
+            jumped && currentDir.isEmpty() -> {
+                Toast.makeText(context, "已回到根目录，请拖到某个文件夹上再松手", Toast.LENGTH_SHORT).show()
+                null
+            }
+            jumped -> "$currentDir/"
+            else -> null
+        } ?: return
+        doMove(v, target)
+    }
+
+    // 打开生成对话框时统计一次：待生成多少、有多少已判定无对白被跳过
+    LaunchedEffect(showGenSubtitleDialog) {
+        if (!showGenSubtitleDialog) {
+            genPlanText = null
+            return@LaunchedEffect
+        }
+        genPlanText = "正在统计…"
+        genPlanText = withContext(Dispatchers.IO) {
+            val all = VideoScanner.scan(context)
+            val curEngine = AsrSettings.backend(context)
+            var todo = 0
+            var stale = 0
+            var skipped = 0
+            all.forEach { v ->
+                if (SubtitleStore.hasUsableForEngine(context, v, curEngine.id)) return@forEach
+                if (SubtitleStore.hasUsable(context, v)) {
+                    // 有字幕，但是旧引擎生成的
+                    stale++
+                    return@forEach
+                }
+                if (GenAttempts.shouldSkip(context, v) != null) skipped++ else todo++
+            }
+            buildString {
+                append("待生成 ${todo + stale} 个")
+                if (stale > 0) append("（其中 $stale 个是旧引擎字幕，需用 ${curEngine.label} 重做）")
+                if (skipped > 0) append("；另有 $skipped 个已判定无对白，已跳过")
+            }.also { AppLog.i("GenPlan", it) }
+        }
+    }
+
     // 系统返回键/边缘右滑手势：先在子目录内逐级回退，到根目录才退出 App。
     // 这样边缘右滑不会被系统直接 finish，而是走这里回上级。
     BackHandler(enabled = currentDir.isNotEmpty() || searching) {
@@ -123,15 +373,18 @@ fun VideoListScreen(
         }.distinct().sorted()
     }
 
+    // 子目录 = 当前目录下所有视频路径的下一级目录。
+    // 注意：不能再要求「rest 里必须还有 /」——否则像 Pictures/ 这种直接躺着视频、
+    // 下面没建子目录的情况，Pictures 文件夹卡片本身就不会出现在根目录里。
     val childDirs = remember(videos, currentDir, searching) {
         if (searching) {
             emptyList()
         } else {
             val prefix = if (currentDir.isEmpty()) "" else "$currentDir/"
             videos.mapNotNull { video ->
-                val path = video.relativePath.trimEnd('/')
-                val rest = if (prefix.isEmpty()) path else path.removePrefix(prefix)
-                if (path.startsWith(prefix) && rest.contains('/')) rest.substringBefore('/') else null
+                val dir = video.relativePath.trimEnd('/')
+                if (dir.length <= prefix.length || !dir.startsWith(prefix)) return@mapNotNull null
+                dir.substring(prefix.length).substringBefore('/').ifEmpty { null }
             }.distinct().sorted()
         }
     }
@@ -143,7 +396,11 @@ fun VideoListScreen(
                     it.relativePath.contains(query, ignoreCase = true)
             }
         } else {
-            videos.filter { it.relativePath.trimEnd('/').substringBeforeLast("/", "") == currentDir }
+            // 只显示「视频本身就放在这个目录里」的那些。
+            // 旧写法是 substringBeforeLast("/")，会把 Download/、Pictures/ 这类一级目录里的视频
+            // 也算到根目录名下（父级求出来都是 ""），于是根目录能看到一堆其实在子目录里的视频，
+            // 移走之后"看起来没动"——这正是用户报的「主列表还能看到它」。
+            videos.filter { it.relativePath.trimEnd('/') == currentDir }
         }
         if (selectedType == null) {
             base
@@ -163,18 +420,116 @@ fun VideoListScreen(
     }
 
     Box(
-        modifier = Modifier.fillMaxSize().pointerInput(currentDir, searching) {
-            if (currentDir.isEmpty() || searching) return@pointerInput
-            var totalDx = 0f
-            detectHorizontalDragGestures(
-                onDragStart = { totalDx = 0f },
-                onHorizontalDrag = { _, amount -> totalDx += amount },
-                onDragEnd = {
-                    if (totalDx > 140f) currentDir = currentDir.substringBeforeLast("/", "")
-                },
-                onDragCancel = { totalDx = 0f },
-            )
-        },
+        modifier = Modifier
+            .fillMaxSize()
+            .onGloballyPositioned { rootOrigin = it.positionInWindow() }
+            .pointerInput(currentDir, searching) {
+                if (currentDir.isEmpty() || searching) return@pointerInput
+                var totalDx = 0f
+                detectHorizontalDragGestures(
+                    onDragStart = { totalDx = 0f },
+                    onHorizontalDrag = { _, amount -> totalDx += amount },
+                    onDragEnd = {
+                        if (totalDx > 140f) currentDir = currentDir.substringBeforeLast("/", "")
+                    },
+                    onDragCancel = { totalDx = 0f },
+                )
+            }
+            .pointerInput(Unit) {
+                // 长按弹菜单 / 长按拖动移动。
+                // 挂在根节点上（列表的父级）：事件一定经过这里，且列表行被 LazyColumn 回收时
+                // 手势不会被连带取消——拖到顶部回上一级时正是这种场景。
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    val downAt = SystemClock.uptimeMillis()
+                    val timeoutMs = viewConfiguration.longPressTimeoutMillis
+                    val slop = viewConfiguration.touchSlop
+                    val hitVideo = videoRects.entries
+                        .firstOrNull { it.value.contains(down.position + rootOrigin) }
+                        ?.key
+                        ?.let { id -> videosState.value.firstOrNull { it.id == id } }
+                    if (hitVideo == null) return@awaitEachGesture
+
+                    // 三种结局：
+                    // ① 按住不动到点 → 长按菜单
+                    // ② 按住往右划一小段 → 直接唤菜单（不用等 500ms）
+                    // ③ 纵向移动（滚列表）/ 往左划（返回上级）→ 让给下层
+                    // 旧写法只要位移超过 touchSlop 就取消长按，手指稍微一偏就变成"点进播放"，
+                    // 这就是用户说的"长按经常直接进播放"。
+                    var longPressed = false
+                    var swiped = false
+                    while (true) {
+                        val remain = downAt + timeoutMs - SystemClock.uptimeMillis()
+                        if (remain <= 0) {
+                            longPressed = true
+                            break
+                        }
+                        val event = withTimeoutOrNull(remain) { awaitPointerEvent() }
+                        if (event == null) {
+                            longPressed = true
+                            break
+                        }
+                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                        if (!change.pressed) break
+                        val dx = change.position.x - down.position.x
+                        val dy = change.position.y - down.position.y
+                        if (dx > menuSwipePx && dx > kotlin.math.abs(dy) * 1.5f) {
+                            change.consume()
+                            swiped = true
+                            break
+                        }
+                        // 只有"纵向为主"或"往左划"才让给下层；横向小抖动不再打断长按
+                        if (kotlin.math.abs(dy) > slop || dx < -slop) break
+                        if (change.isConsumed) break
+                    }
+
+                    if (swiped) {
+                        // 手指还按着，先把剩余事件吃掉，等抬起来再弹菜单，免得上屏就点到菜单项
+                        while (true) {
+                            val ev = awaitPointerEvent()
+                            val ch = ev.changes.firstOrNull { it.id == down.id } ?: break
+                            ch.consume()
+                            if (!ch.pressed) break
+                        }
+                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                        actionTarget = hitVideo
+                        return@awaitEachGesture
+                    }
+                    if (!longPressed) return@awaitEachGesture
+
+                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                    dragVideo = hitVideo
+                    dragMoved = false
+                    dragPos = down.position + rootOrigin
+                    var moved = false
+                    var ended = false
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                        change.consume()
+                        if (!change.pressed) {
+                            ended = true
+                            if (moved) {
+                                finishDrag()
+                            } else {
+                                resetDrag()
+                                actionTarget = hitVideo
+                            }
+                            break
+                        }
+                        if (!moved &&
+                            (change.position - down.position).getDistance() > slop / 2f
+                        ) {
+                            moved = true
+                        }
+                        if (moved) {
+                            dragMoved = true
+                            onDragPosition(change.position + rootOrigin)
+                        }
+                    }
+                    if (!ended) resetDrag()
+                }
+            },
     ) {
         Column(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
 
@@ -296,7 +651,11 @@ fun VideoListScreen(
             }
 
             // ---- 列表（右侧带滚动位置指示条）----
-            Box(modifier = Modifier.fillMaxSize()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .onGloballyPositioned { listTopInWindow = it.boundsInWindow().top },
+            ) {
             val listState = rememberLazyListState()
             val itemCount = childDirs.size + sorted.size
             LazyColumn(
@@ -306,11 +665,15 @@ fun VideoListScreen(
                     start = 12.dp, end = 12.dp, top = 4.dp,
                     bottom = 24.dp,
                 ),
+                userScrollEnabled = dragVideo == null,
             ) {
                 if (!searching) {
                     items(childDirs, key = { "dir:$it" }) { dir ->
                         DirCard(
                             name = dir,
+                            highlighted = dragMoved && hoverDir == dir,
+                            onBounds = { rect -> dirRects[dir] = rect },
+                            onGone = { dirRects.remove(dir) },
                             onClick = {
                                 currentDir = if (currentDir.isEmpty()) dir else "$currentDir/$dir"
                                 query = ""
@@ -319,10 +682,13 @@ fun VideoListScreen(
                     }
                 }
                 items(sorted, key = { it.id }) { video ->
+                    // 长按/拖拽由外层全屏手势层统一处理：列表项会在切目录时被回收，
+                    // 手势放在项里会被连带取消，拖到顶部回上一级就断了。
                     VideoCard(
                         video = video,
                         onClick = { onSelect(video) },
-                        onLongClick = { renameTarget = video },
+                        onBounds = { rect -> videoRects[video.id] = rect },
+                        onGone = { videoRects.remove(video.id) },
                     )
                 }
             }
@@ -358,6 +724,153 @@ fun VideoListScreen(
             }
             }
         }
+
+        // ---- 拖拽浮层 ----
+        val draggingVideo = dragVideo
+        if (draggingVideo != null && dragMoved) {
+            // 顶部提示：分两阶段——"停留一下才回上级" / "已回到上级，松手就移到这里"
+            val topLabel = when {
+                jumpedUp && currentDir.isEmpty() -> "松手无效：根目录不能作为目标"
+                jumpedUp -> "松手移入：${currentDir.substringAfterLast("/")}"
+                jumpHint && currentDir.isNotEmpty() -> "停留一下返回上一级"
+                else -> null
+            }
+            if (topLabel != null) {
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.primaryContainer,
+                    shadowElevation = 4.dp,
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .statusBarsPadding()
+                        .padding(top = 6.dp),
+                ) {
+                    Text(
+                        text = topLabel,
+                        style = MaterialTheme.typography.labelMedium,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                    )
+                }
+            }
+            Surface(
+                shape = RoundedCornerShape(10.dp),
+                color = MaterialTheme.colorScheme.primaryContainer,
+                shadowElevation = 10.dp,
+                modifier = Modifier
+                    .offset {
+                        IntOffset(
+                            (dragPos.x - rootOrigin.x - 90.dp.toPx()).roundToInt(),
+                            (dragPos.y - rootOrigin.y - 26.dp.toPx()).roundToInt(),
+                        )
+                    }
+                    .width(180.dp),
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                ) {
+                    Icon(
+                        Icons.Filled.DriveFileMove,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = draggingVideo.name,
+                        style = MaterialTheme.typography.labelMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
+    }
+
+    // ---- 长按菜单：本视频字幕 / 重命名 / 删除 ----
+    actionTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { actionTarget = null },
+            title = {
+                Text(
+                    target.name,
+                    style = MaterialTheme.typography.titleSmall,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            },
+            text = {
+                Column {
+                    // 只处理这一条，不扫全量：已生成过的再点就是覆盖重做
+                    val hasSrt = SubtitleStore.exists(context, target)
+                    MenuRow(
+                        Icons.Filled.Subtitles,
+                        if (hasSrt) "重新生成这个视频的字幕" else "为这个视频生成字幕",
+                    ) {
+                        actionTarget = null
+                        if (SubtitleGenerationService.isRunning()) {
+                            Toast.makeText(
+                                context,
+                                "已有字幕任务在跑，等它结束或点通知栏的取消",
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                        } else {
+                            SubtitleGenerationService.startSingle(context, target.id)
+                            Toast.makeText(
+                                context,
+                                if (hasSrt) "已开始重新生成，进度见通知栏" else "已开始生成字幕，进度见通知栏",
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                        }
+                    }
+                    MenuRow(Icons.Filled.Edit, "重命名") {
+                        actionTarget = null
+                        renameTarget = target
+                    }
+                    MenuRow(Icons.Filled.Delete, "删除", danger = true) {
+                        actionTarget = null
+                        deleteTarget = target
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { actionTarget = null }) { Text("取消") }
+            },
+        )
+    }
+
+    // ---- 删除确认 ----
+    deleteTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { deleteTarget = null },
+            title = { Text("删除视频？") },
+            text = {
+                Column {
+                    Text(
+                        target.name,
+                        style = MaterialTheme.typography.bodyMedium,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        "会从设备上物理删除该视频文件，同名字幕（.srt）一并删除，无法恢复。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    deleteTarget = null
+                    doDelete(target)
+                }) { Text("删除", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { deleteTarget = null }) { Text("取消") }
+            },
+        )
     }
 
     // ---- 重命名对话框 ----
@@ -378,6 +891,10 @@ fun VideoListScreen(
         )
     }
 
+    // ---- 识别引擎选择：可用模型列表（外部目录里有什么就显示什么）----
+    val engines = remember { AsrModels.available(context) }
+    var engine by remember { mutableStateOf(AsrSettings.backend(context)) }
+
     // ---- 生成离线字幕：两个入口（全量补齐 / 清空重做）----
     if (showGenSubtitleDialog) {
         AlertDialog(
@@ -389,6 +906,52 @@ fun VideoListScreen(
                         "字幕在本机生成，不联网。请选择生成方式：",
                         style = MaterialTheme.typography.bodyMedium,
                     )
+                    genPlanText?.let {
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            it,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+
+                    // 识别引擎：只有 Paraformer 内置，其余从 files/models 加载
+                    Spacer(Modifier.height(14.dp))
+                    Text(
+                        "识别引擎",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        engines.forEach { b ->
+                            FilterChip(
+                                selected = engine == b,
+                                onClick = {
+                                    engine = b
+                                    AsrSettings.setBackend(context, b)
+                                },
+                                label = { Text(b.label, style = MaterialTheme.typography.labelMedium) },
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        engine.note,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    if (engines.size == 1) {
+                        Text(
+                            "更多模型可用 dist/push_models.sh 推入后自动出现",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+
                     Spacer(Modifier.height(14.dp))
                     GenOptionCard(
                         title = "全量生成",
@@ -514,13 +1077,26 @@ private fun GenOptionCard(title: String, desc: String, onClick: () -> Unit) {
 }
 
 @Composable
-private fun DirCard(name: String, onClick: () -> Unit) {
+private fun DirCard(
+    name: String,
+    highlighted: Boolean = false,
+    onBounds: (Rect) -> Unit = {},
+    onGone: () -> Unit = {},
+    onClick: () -> Unit,
+) {
+    // 列表滚出屏幕后旧坐标必须失效，否则拖拽会命中已经不在屏幕上的文件夹
+    androidx.compose.runtime.DisposableEffect(name) {
+        onDispose { onGone() }
+    }
     Surface(
         shape = RoundedCornerShape(12.dp),
-        color = MaterialTheme.colorScheme.surface,
+        color = if (highlighted) MaterialTheme.colorScheme.primaryContainer
+        else MaterialTheme.colorScheme.surface,
+        border = if (highlighted) BorderStroke(2.dp, MaterialTheme.colorScheme.primary) else null,
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 4.dp)
+            .onGloballyPositioned { onBounds(it.boundsInWindow()) }
             .clickable(onClick = onClick),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(12.dp)) {
@@ -550,10 +1126,14 @@ private fun DirCard(name: String, onClick: () -> Unit) {
 private fun VideoCard(
     video: VideoItem,
     onClick: () -> Unit,
-    onLongClick: () -> Unit,
+    onBounds: (Rect) -> Unit = {},
+    onGone: () -> Unit = {},
 ) {
     val context = LocalContext.current
     var thumb by remember(video.id) { mutableStateOf<ImageBitmap?>(ThumbnailLoader.cached(video.id)) }
+    androidx.compose.runtime.DisposableEffect(video.id) {
+        onDispose { onGone() }
+    }
     androidx.compose.runtime.LaunchedEffect(video.id) {
         if (thumb == null && ThumbnailLoader.load(context.contentResolver, video)) {
             thumb = ThumbnailLoader.cached(video.id)
@@ -565,13 +1145,9 @@ private fun VideoCard(
         color = MaterialTheme.colorScheme.surface,
         modifier = Modifier
             .fillMaxWidth()
+            .onGloballyPositioned { onBounds(it.boundsInWindow()) }
             .padding(vertical = 4.dp)
-            .pointerInput(Unit) {
-                detectTapGestures(
-                    onTap = { onClick() },
-                    onLongPress = { onLongClick() },
-                )
-            },
+            .clickable(onClick = onClick),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(12.dp)) {
             Box(
@@ -666,7 +1242,36 @@ private fun formatSize(bytes: Long): String = when {
     else -> String.format("%.0f KB", bytes / 1024.0)
 }
 
+/** 待系统授权后重试的文件操作：targetDir 为 null 表示删除。 */
+private data class PendingFileOp(val video: VideoItem, val targetDir: String?)
+
+/** 长按菜单里的一行。 */
+@Composable
+private fun MenuRow(
+    icon: ImageVector,
+    label: String,
+    danger: Boolean = false,
+    onClick: () -> Unit,
+) {
+    val tint = if (danger) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(onClick = onClick)
+            .padding(vertical = 12.dp, horizontal = 4.dp),
+    ) {
+        Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(20.dp))
+        Spacer(Modifier.width(12.dp))
+        Text(label, style = MaterialTheme.typography.bodyLarge, color = tint)
+    }
+}
+
 private fun formatDuration(ms: Long): String {
     val totalSec = ms / 1000
     return String.format("%02d:%02d:%02d", totalSec / 3600, totalSec % 3600 / 60, totalSec % 60)
 }
+
+/** 拖到列表顶端后要停留多久才认定为"回上一级"。太短会误触，太长会嫌烦。 */
+private const val TOP_DWELL_MS = 700L

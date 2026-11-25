@@ -78,17 +78,26 @@ class SubtitleGenerationService : Service() {
             return START_NOT_STICKY
         }
         val force = intent?.getBooleanExtra(EXTRA_FORCE, false) ?: false
+        val onlyId = intent?.getLongExtra(EXTRA_ONLY_ID, -1L) ?: -1L
         RUNNING.set(true)
         cancelled.set(false)
         startForegroundCompat(
-            buildNotification(if (force) "准备重新生成全部字幕…" else "准备生成字幕…", 0, false),
+            buildNotification(
+                when {
+                    onlyId > 0 -> "准备生成该视频的字幕…"
+                    force -> "准备重新生成全部字幕…"
+                    else -> "准备生成字幕…"
+                },
+                0,
+                false,
+            ),
         )
         // 必须在开始干活前就拿锁：否则用户一锁屏，下面第一批解码就停了
         acquireWakeLock()
         publishStatus("准备生成字幕…", force = true)
 
         job = scope.launch {
-            runBatch(force)
+            runBatch(force, onlyId)
         }
         return START_NOT_STICKY
     }
@@ -177,10 +186,31 @@ class SubtitleGenerationService : Service() {
         )
     }
 
-    private suspend fun runBatch(force: Boolean) {
+    private suspend fun runBatch(force: Boolean, onlyId: Long = -1L) {
         var generator: OfflineSubtitleGenerator? = null
         try {
-            val (all, pending) = withContext(Dispatchers.IO) {
+            // 引擎要在扫描前确定：待办判定依赖"这份字幕是不是当前引擎生成的"
+            val backend = AsrSettings.backend(this@SubtitleGenerationService)
+            fileLog("engine: ${backend.id} (${backend.label})")
+            val (all, pending) = if (onlyId > 0) {
+                // 单视频模式：只按 id 精确取一条，不扫全量
+                val one = withContext(Dispatchers.IO) {
+                    VideoScanner.findById(this@SubtitleGenerationService, onlyId)
+                }
+                if (one == null) {
+                    fileLog("single: video gone, id=$onlyId")
+                    emptyList<VideoItem>() to emptyList<VideoItem>()
+                } else {
+                    // 用户显式点了「生成本视频字幕」= 覆盖重来：先清旧字幕和失败记录，
+                    // 否则已有可用字幕会被判成"无需处理"，点了没有任何反应。
+                    withContext(Dispatchers.IO) {
+                        SubtitleStore.clearForRegenerate(this@SubtitleGenerationService, one)
+                        GenAttempts.forget(this@SubtitleGenerationService, one)
+                        fileLog("single: ${one.name} (${one.relativePath})")
+                    }
+                    listOf(one) to listOf(one)
+                }
+            } else withContext(Dispatchers.IO) {
                 val scanned = VideoScanner.scan(this@SubtitleGenerationService)
                 fileLog("scan: total=${scanned.size} force=$force")
                 if (force) {
@@ -189,41 +219,84 @@ class SubtitleGenerationService : Service() {
                     scanned.forEach {
                         if (SubtitleStore.clearForRegenerate(this@SubtitleGenerationService, it)) cleared++
                     }
-                    fileLog("force mode: cleared $cleared srt files")
+                    // 清空「已试过」记录，让之前跳过的视频重新参与
+                    GenAttempts.clear(this@SubtitleGenerationService)
+                    fileLog("force mode: cleared $cleared srt files, reset attempt records")
                     scanned to scanned
                 } else {
                     // 只跳过「存在且校验通过」的字幕；坏文件（时间轴错乱/覆盖过低）重新生成
-                    val todo = scanned.filterNot {
-                        val ok = SubtitleStore.hasUsable(this@SubtitleGenerationService, it)
-                        if (!ok && SubtitleStore.exists(this@SubtitleGenerationService, it)) {
-                            fileLog("invalid srt, will regenerate: ${it.name}")
+                    var skippedByAttempt = 0
+                    var staleEngine = 0
+                    val todo = scanned.filterNot { video ->
+                        val usable = SubtitleStore.hasUsable(this@SubtitleGenerationService, video)
+                        if (usable) {
+                            if (SubtitleStore.hasUsableForEngine(
+                                    this@SubtitleGenerationService, video, backend.id,
+                                )
+                            ) {
+                                GenAttempts.forget(this@SubtitleGenerationService, video)
+                                return@filterNot true
+                            }
+                            // 字幕可用但不是当前引擎生成的：换模型后需要重做
+                            staleEngine++
+                            return@filterNot false
                         }
-                        ok
+                        // 已经试过且拿不到可用字幕的先跳过，避免每次重解码（无对白短视频）
+                        val why = GenAttempts.shouldSkip(this@SubtitleGenerationService, video)
+                        if (why != null) {
+                            skippedByAttempt++
+                            return@filterNot true
+                        }
+                        if (SubtitleStore.exists(this@SubtitleGenerationService, video)) {
+                            fileLog("invalid srt, will regenerate: ${video.name}")
+                        }
+                        false
+                    }
+                    if (skippedByAttempt > 0) {
+                        fileLog("skipped by attempt record: $skippedByAttempt")
+                    }
+                    if (staleEngine > 0) {
+                        fileLog("stale engine (${backend.id}) -> regenerate: $staleEngine")
                     }
                     scanned to todo
                 }
             }
             Log.i(TAG, "batch start: total=${all.size} pending=${pending.size}")
             if (pending.isEmpty()) {
-                updateNotification("所有视频均已有字幕", 100, false)
-                stopSelf()
+                updateNotification(
+                    if (onlyId > 0) "该视频已不存在（可能被删除或移动）" else "所有视频均已有字幕",
+                    100,
+                    false,
+                )
+                // 不在这里 stopSelf：交给 finally 统一 detach，通知才能留在通知栏
                 return
             }
 
             // 模型整批只加载一次（重操作，切到 Default 线程，避免卡主线程）
             withContext(Dispatchers.Default) {
-                updateNotification("加载语音识别模型（约 228MB）…", 0, true)
-                generator = OfflineSubtitleGenerator(this@SubtitleGenerationService).also { it.prepare() }
+                updateNotification("加载 ${backend.label} 模型（约 ${backend.sizeMb}MB）…", 0, true)
+                generator = OfflineSubtitleGenerator(this@SubtitleGenerationService, backend)
+                    .also { it.prepare() }
             }
             val gen = generator ?: run {
                 updateNotification("模型加载失败", 0, false)
-                stopSelf()
                 return
             }
+            if (!gen.isPrepared()) {
+                fileLog("engine load failed: ${gen.lastError}")
+                updateNotification("模型加载失败：${gen.lastError ?: "未知原因"}", 0, false)
+                return
+            }
+            fileLog("engine ready: ${backend.id} (${backend.label})")
 
             var done = 0
             var succeeded = 0
             var failed = 0
+            // 失败原因计数：结束时直接写进通知，用户不用去翻日志就知道为什么没生成
+            val failReasons = linkedMapOf<String, Int>()
+            fun countFail(reason: String) {
+                failReasons[reason] = (failReasons[reason] ?: 0) + 1
+            }
 
             for (video in pending) {
                 if (cancelled.get() || !currentCoroutineContext().isActive) break
@@ -273,14 +346,19 @@ class SubtitleGenerationService : Service() {
                     }
                     if (durMs == null) {
                         failed++
+                        countFail("无音轨")
                         Log.w(TAG, "no audio / decode failed: $name")
+                        fileLog("no audio: $name")
+                        GenAttempts.record(this@SubtitleGenerationService, video, "noaudio")
                         done++
                         continue
                     }
                     if (allCues.isEmpty()) {
                         failed++
+                        countFail("未检测到语音")
                         Log.w(TAG, "no speech recognized: $name")
                         fileLog("no speech: $name")
+                        GenAttempts.record(this@SubtitleGenerationService, video, "nospeech")
                         done++
                         continue
                     }
@@ -290,8 +368,10 @@ class SubtitleGenerationService : Service() {
                     val clean = SrtFile.sanitize(allCues, durationForCheck)
                     if (clean.isEmpty()) {
                         failed++
+                        countFail("时间轴无效")
                         Log.w(TAG, "all cues invalid after sanitize: $name")
                         fileLog("all cues invalid: $name raw=${allCues.size}")
+                        GenAttempts.record(this@SubtitleGenerationService, video, "invalid")
                         done++
                         continue
                     }
@@ -308,24 +388,40 @@ class SubtitleGenerationService : Service() {
                     }
                     if (uri != null) {
                         succeeded++
+                        // 记录生成引擎：换模型后这批字幕会被判定为"需要重做"
+                        SubtitleStore.recordEngine(this@SubtitleGenerationService, video, backend.id)
                         Log.i(TAG, "subtitle saved: $name (${clean.size} cues)")
+                        // 写成功了但校验不过（台词太少、覆盖不到片长）也记录下来，
+                        // 否则下一轮又被当成"缺字幕"重新解码。
+                        if (SrtFile.isUsable(clean, durationForCheck)) {
+                            GenAttempts.forget(this@SubtitleGenerationService, video)
+                        } else {
+                            fileLog("short srt: $name cues=${clean.size}")
+                            GenAttempts.record(this@SubtitleGenerationService, video, "short")
+                        }
                     } else {
                         failed++
+                        countFail("写入失败")
                         Log.w(TAG, "write srt failed: $name")
                         fileLog("write failed: $name")
+                        GenAttempts.record(this@SubtitleGenerationService, video, "writefail")
                     }
                 } catch (t: Throwable) {
                     failed++
+                    countFail("识别异常")
                     Log.e(TAG, "generate failed: $name", t)
                     fileLog("generate threw: $name ${t.message}")
                 }
                 done++
             }
 
-            val msg = if (cancelled.get()) {
-                "已取消（成功 $succeeded / 失败 $failed）"
-            } else {
-                "完成：成功 $succeeded / 失败 $failed / 共 ${pending.size}"
+            val reasonText = if (failReasons.isEmpty()) "" else
+                "（" + failReasons.entries.joinToString("、") { "${it.key} ${it.value}" } + "）"
+            val msg = when {
+                cancelled.get() -> "已取消（成功 $succeeded / 失败 $failed）"
+                onlyId > 0 && succeeded > 0 -> "字幕已生成，进视频即可打开"
+                onlyId > 0 -> "没生成字幕 $reasonText"
+                else -> "完成：成功 $succeeded / 失败 $failed / 共 ${pending.size}$reasonText"
             }
             updateNotification(msg, 100, false)
             Log.i(TAG, "batch finished: $msg")
@@ -340,6 +436,12 @@ class SubtitleGenerationService : Service() {
             RUNNING.set(false)
             releaseWakeLock()
             publishStatus("批次结束", force = true)
+            // 关键：结束时把通知从前台服务解绑（DETACH），而不是让它随 stopSelf 一起消失。
+            // 否则进度条一闪就没，用户根本不知道到底成没成功；现在它会留在通知栏（可手动滑掉）。
+            try {
+                stopForeground(STOP_FOREGROUND_DETACH)
+            } catch (_: Throwable) {
+            }
             stopSelf()
         }
     }
@@ -413,9 +515,13 @@ class SubtitleGenerationService : Service() {
         private const val NOTIFICATION_ID = 2026
         const val ACTION_CANCEL = "com.magplay.subtitle.CANCEL"
         private const val EXTRA_FORCE = "com.magplay.subtitle.FORCE"
+        private const val EXTRA_ONLY_ID = "com.magplay.subtitle.ONLY_ID"
 
         /** 批次级单实例守卫：服务实例被系统重建时也不会并发跑两批。 */
         private val RUNNING = AtomicBoolean(false)
+
+        /** 是否已有任务在跑（UI 用它避免"点了没反应"）。 */
+        fun isRunning(): Boolean = RUNNING.get()
 
         /**
          * 启动批量生成。
@@ -425,6 +531,22 @@ class SubtitleGenerationService : Service() {
         fun start(context: Context, force: Boolean = false) {
             val intent = Intent(context, SubtitleGenerationService::class.java)
                 .putExtra(EXTRA_FORCE, force)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
+
+        /**
+         * 只为某一个视频生成字幕（长按菜单入口）。
+         *
+         * 与 [start] 的区别：不扫全量、不看别的视频、已有字幕会被覆盖重做。
+         * 服务内部按 id 直接用 `_ID=?` 查一条，几十毫秒就返回。
+         */
+        fun startSingle(context: Context, videoId: Long) {
+            val intent = Intent(context, SubtitleGenerationService::class.java)
+                .putExtra(EXTRA_ONLY_ID, videoId)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
             } else {

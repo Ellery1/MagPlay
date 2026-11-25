@@ -103,7 +103,7 @@ object SrtFile {
      * 2) 覆盖度 —— 末条结束时间需覆盖到片长 40% 以上（短视频放宽到 5 条即可）；
      * 3) 洗完后不能为空。
      *
-     * 不合格的字幕文件一律视为"没有字幕"：播放页退回实时字幕，生成时重新生成覆盖。
+     * 不合格的字幕文件一律视为"没有字幕"：播放页不显示并提示重新生成，生成时重新生成覆盖。
      */
     fun isUsable(cues: List<SrtCue>, durationMs: Long): Boolean {
         if (cues.isEmpty()) return false
@@ -114,6 +114,10 @@ object SrtFile {
         if (durationMs <= 0) return true
         val lastEnd = clean.last().endMs
         if (lastEnd >= durationMs * 4 / 10) return true
+        // 台词极少的视频（≤4 条，典型是相机/微信小视频、监控片段）：
+        // 样本太少，覆盖度不足不能当坏文件判据；时间轴不越界就认为可用，
+        // 否则这类视频永远过不了校验 → 每次全量生成都被重新解码。
+        if (clean.size <= 4 && lastEnd <= durationMs) return true
         return clean.size >= 5 && durationMs < 120_000
     }
 

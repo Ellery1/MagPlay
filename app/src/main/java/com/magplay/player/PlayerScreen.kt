@@ -19,8 +19,6 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -50,7 +48,6 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -65,14 +62,8 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
-import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.audio.AudioSink
-import androidx.media3.exoplayer.audio.DefaultAudioSink
-import androidx.media3.exoplayer.audio.TeeAudioProcessor
 import androidx.media3.ui.PlayerView
-import com.magplay.asr.PcmCaptureSink
-import com.magplay.asr.SubtitleAsrEngine
 import com.magplay.data.AppLog
 import com.magplay.data.VideoItem
 import com.magplay.subtitle.SrtCue
@@ -106,17 +97,17 @@ private data class GestureHint(
     val sticky: Boolean = false,
 )
 
-/** 字幕来源：关 / 离线文件 / 实时识别。 */
-private enum class SubtitleSource { OFF, OFFLINE, REALTIME }
-
-@OptIn(ExperimentalFoundationApi::class)
+/**
+ * 字幕只有一条链路：离线 .srt 文件。
+ * 曾经的"实时识别"（伪流式 VAD + 离线模型逐句识别）已按需求砍掉——它整句说完才出字幕，
+ * 与画面差 0.5~1 秒，且准确率不可能超过离线全片段识别。准确率优先，只留离线。
+ */
 @Composable
 fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
     BackHandler(onBack = onBack)
 
     val context = LocalContext.current
     val activity = context as? Activity
-    val scope = rememberCoroutineScope()
     val audioManager = remember { context.getSystemService(Context.AUDIO_SERVICE) as AudioManager }
     val minVolume = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
         audioManager.getStreamMinVolume(AudioManager.STREAM_MUSIC)
@@ -138,37 +129,17 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
         }
     }
 
-    // ---- 字幕状态 ----
+    // ---- 字幕状态：唯一来源是同目录同名 .srt ----
     var subtitleText by remember { mutableStateOf("") }
-    var subtitleFinal by remember { mutableStateOf(true) }
-    var asrStatus by remember { mutableStateOf(SubtitleAsrEngine.Status.RELEASED) }
-    var asrEngine by remember { mutableStateOf<SubtitleAsrEngine?>(null) }
-    var subtitleSource by remember { mutableStateOf(SubtitleSource.OFF) }
+    var subtitleOn by remember { mutableStateOf(false) }
 
-    // 离线字幕：进入播放页时查同目录同名 .srt；只有校验通过才用，坏文件退回实时
+    // 进入播放页时查同目录同名 .srt；只有校验通过才用
     var offlineCues by remember { mutableStateOf<List<SrtCue>>(emptyList()) }
     var offlineBad by remember { mutableStateOf(false) }
     val hasOffline = offlineCues.isNotEmpty()
-    val mainHandler = remember { Handler(Looper.getMainLooper()) }
-
-    // 音频线程只做 memcpy，回调入 ASR 队列
-    val pcmSink = remember {
-        PcmCaptureSink { raw -> asrEngine?.acceptRaw(raw) }
-    }
 
     val player = remember(item.uri) {
-        val renderersFactory = object : DefaultRenderersFactory(context) {
-            override fun buildAudioSink(
-                context: Context,
-                enableFloatOutput: Boolean,
-                enableAudioTrackPlaybackParams: Boolean,
-            ): AudioSink {
-                return DefaultAudioSink.Builder(context)
-                    .setAudioProcessors(arrayOf(TeeAudioProcessor(pcmSink)))
-                    .build()
-            }
-        }
-        ExoPlayer.Builder(context, renderersFactory).build().apply {
+        ExoPlayer.Builder(context).build().apply {
             setMediaItem(MediaItem.fromUri(item.uri))
             prepare()
             playWhenReady = true
@@ -177,14 +148,6 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
 
     DisposableEffect(player) {
         val listener = object : Player.Listener {
-            override fun onPositionDiscontinuity(
-                oldPosition: Player.PositionInfo,
-                newPosition: Player.PositionInfo,
-                reason: Int,
-            ) {
-                if (reason == Player.DISCONTINUITY_REASON_SEEK) asrEngine?.reset()
-            }
-
             override fun onPlayerError(error: PlaybackException) {
                 // 播放失败记进 App 内日志：用户导出后即可定位，无需 adb
                 AppLog.e(
@@ -204,9 +167,6 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
         onDispose {
             player.removeListener(listener)
             player.release()
-            asrEngine?.release()
-            asrEngine = null
-            pcmSink.setEnabled(false)
         }
     }
 
@@ -254,65 +214,23 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
         )
     }
 
-    // ---- 字幕来源控制：离线文件 / 实时识别 / 关闭 ----
-    fun stopRealtime() {
-        val engine = asrEngine
-        asrEngine = null
-        pcmSink.setEnabled(false)
-        engine?.release() // 内部会先等解码线程退出再释放 native 对象
-        asrStatus = SubtitleAsrEngine.Status.RELEASED
-    }
-
-    fun startRealtime() {
-        if (asrEngine != null) return
+    // ---- 字幕开关 ----
+    fun toggleSubtitle() {
+        if (!hasOffline) {
+            showHint(
+                HINT_INFO,
+                if (offlineBad) "字幕文件异常，请在列表页重新生成" else "该视频还没有字幕，请在列表页生成",
+                0f,
+            )
+            return
+        }
+        subtitleOn = !subtitleOn
         subtitleText = ""
-        val newEngine = SubtitleAsrEngine(
-            context = context.applicationContext,
-            scope = scope,
-            onText = { text, isFinal ->
-                mainHandler.post {
-                    subtitleText = text
-                    subtitleFinal = isFinal
-                }
-            },
-            onStatus = { status -> mainHandler.post { asrStatus = status } },
-        )
-        asrEngine = newEngine
-        // 先加载模型就绪，再打开 PCM 截获，避免加载期数据把队列挤满
-        newEngine.load()
-        pcmSink.setEnabled(true)
-        Log.i("MagPlayPlayer", "realtime subtitle ON, pcmSink received so far=${pcmSink.receivedCount.get()}")
-        AppLog.i("Subtitle", "启用实时字幕：${item.name}")
+        showHint(HINT_INFO, if (subtitleOn) "字幕 开" else "字幕 关", 0f)
+        AppLog.i("Subtitle", if (subtitleOn) "开启字幕：${item.name}" else "关闭字幕：${item.name}")
     }
 
-    fun applySource(target: SubtitleSource, announce: Boolean = true) {
-        when (target) {
-            SubtitleSource.OFFLINE -> {
-                stopRealtime()
-                subtitleText = ""
-                subtitleSource = SubtitleSource.OFFLINE
-            }
-            SubtitleSource.REALTIME -> {
-                subtitleSource = SubtitleSource.REALTIME
-                startRealtime()
-            }
-            SubtitleSource.OFF -> {
-                stopRealtime()
-                subtitleText = ""
-                subtitleSource = SubtitleSource.OFF
-            }
-        }
-        if (announce) {
-            val label = when (target) {
-                SubtitleSource.OFFLINE -> "离线字幕"
-                SubtitleSource.REALTIME -> "实时字幕"
-                SubtitleSource.OFF -> "字幕已关闭"
-            }
-            showHint(HINT_INFO, label, 0f)
-        }
-    }
-
-    // 进入播放页：查同目录同名 .srt，校验通过才用离线；坏文件自动退回实时字幕
+    // 进入播放页：查同目录同名 .srt，校验通过才用
     LaunchedEffect(item.uri) {
         val raw = withContext(Dispatchers.IO) { SubtitleStore.loadCues(context, item) }
         if (raw == null) {
@@ -324,62 +242,30 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
             val clean = SrtFile.sanitize(raw, item.durationMs)
             offlineCues = clean
             offlineBad = false
-            subtitleSource = SubtitleSource.OFFLINE
+            subtitleOn = true
             Log.i("MagPlayPlayer", "offline subtitle matched: ${clean.size} cues for ${item.name}")
             AppLog.i("Subtitle", "离线字幕命中：${clean.size} 条，${item.name}")
         } else {
-            // 文件在但内容不可用（时间轴错乱/覆盖过低）——之前会死死挡住实时字幕，导致全片无字幕
+            // 文件在但内容不可用（时间轴错乱/覆盖过低）：当作没有字幕，提示重新生成
             offlineCues = emptyList()
             offlineBad = true
             Log.w(
                 "MagPlayPlayer",
-                "offline subtitle invalid: ${raw.size} cues, duration=${item.durationMs}ms, ${item.name} -> fallback realtime",
+                "offline subtitle invalid: ${raw.size} cues, duration=${item.durationMs}ms, ${item.name}",
             )
-            AppLog.w("Subtitle", "离线字幕校验不通过（${raw.size} 条 / 片长 ${item.durationMs}ms），退回实时：${item.name}")
-            applySource(SubtitleSource.REALTIME, announce = false)
-            showHint(HINT_INFO, "离线字幕不完整，已启用实时字幕", 0f)
+            AppLog.w("Subtitle", "离线字幕校验不通过（${raw.size} 条 / 片长 ${item.durationMs}ms）：${item.name}")
+            showHint(HINT_INFO, "字幕文件不完整，建议重新生成", 0f)
         }
     }
 
     // 离线字幕：按播放进度每 200ms 查找当前 cue
-    LaunchedEffect(subtitleSource, offlineCues) {
-        if (subtitleSource != SubtitleSource.OFFLINE) return@LaunchedEffect
+    LaunchedEffect(subtitleOn, offlineCues) {
+        if (!subtitleOn) return@LaunchedEffect
         while (true) {
             val cue = SrtFile.cueAt(offlineCues, player.currentPosition)
             val text = cue?.text ?: ""
-            if (text != subtitleText) {
-                subtitleText = text
-                subtitleFinal = true
-            }
+            if (text != subtitleText) subtitleText = text
             delay(200)
-        }
-    }
-
-    /** 短按：开/关。 */
-    fun toggleSubtitle() {
-        if (subtitleSource != SubtitleSource.OFF) {
-            applySource(SubtitleSource.OFF)
-            return
-        }
-        // 优先离线（已在内存里，零延迟），没有可用离线文件才走实时
-        applySource(if (hasOffline) SubtitleSource.OFFLINE else SubtitleSource.REALTIME)
-    }
-
-    /** 长按：在离线 / 实时之间切换（两条链路同时可用时由用户决定）。 */
-    fun switchSubtitleSource() {
-        when {
-            subtitleSource == SubtitleSource.OFFLINE -> applySource(SubtitleSource.REALTIME)
-            subtitleSource == SubtitleSource.REALTIME -> {
-                if (hasOffline) applySource(SubtitleSource.OFFLINE)
-                else showHint(HINT_INFO, "该视频没有可用离线字幕", 0f)
-            }
-            else -> {
-                if (!hasOffline) {
-                    showHint(HINT_INFO, "该视频没有可用离线字幕", 0f)
-                    return
-                }
-                applySource(SubtitleSource.OFFLINE)
-            }
         }
     }
 
@@ -389,7 +275,6 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
         val clamped = value.coerceIn(1f, 4f)
         speed = clamped
         player.playbackParameters = PlaybackParameters(clamped)
-        asrEngine?.reset()
     }
 
     fun readBrightness(): Float {
@@ -726,28 +611,28 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.padding(end = 16.dp, bottom = 14.dp),
             ) {
-                // 字幕：单击开/关，长按切换 离线 ↔ 实时
+                // 字幕：单击开/关（只有离线 .srt 一条链路，没有可切换的来源）
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
                         .clip(RoundedCornerShape(14.dp))
                         .background(
-                            if (subtitleSource != SubtitleSource.OFF) Color(0xFF2E7D52)
-                            else Color.Black.copy(alpha = 0.55f),
+                            when {
+                                subtitleOn -> Color(0xFF2E7D52)
+                                !hasOffline -> Color.Black.copy(alpha = 0.35f)
+                                else -> Color.Black.copy(alpha = 0.55f)
+                            },
                         )
-                        .combinedClickable(
-                            onClick = { toggleSubtitle() },
-                            onLongClick = { switchSubtitleSource() },
-                        )
+                        .clickable { toggleSubtitle() }
                         .padding(horizontal = 10.dp, vertical = 5.dp),
                 ) {
                     Text(
-                        text = when (subtitleSource) {
-                            SubtitleSource.OFFLINE -> "离线字幕"
-                            SubtitleSource.REALTIME -> "实时字幕"
-                            SubtitleSource.OFF -> "字幕 关"
+                        text = when {
+                            !hasOffline -> "无字幕"
+                            subtitleOn -> "字幕 开"
+                            else -> "字幕 关"
                         },
-                        color = Color.White,
+                        color = if (hasOffline || subtitleOn) Color.White else Color.White.copy(alpha = 0.5f),
                         style = MaterialTheme.typography.labelSmall,
                         fontWeight = FontWeight.Medium,
                     )
@@ -798,10 +683,10 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
         }
 
         // 字幕叠加层（属于视频内容，始终显示）——贴底、字号收小
-        if (subtitleSource != SubtitleSource.OFF && subtitleText.isNotBlank()) {
+        if (subtitleOn && subtitleText.isNotBlank()) {
             Text(
                 text = subtitleText,
-                color = if (subtitleFinal) Color.White else Color.White.copy(alpha = 0.65f),
+                color = Color.White,
                 style = MaterialTheme.typography.bodyLarge,
                 textAlign = TextAlign.Center,
                 maxLines = 2,
@@ -811,27 +696,6 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
                     .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(8.dp))
                     .padding(horizontal = 12.dp, vertical = 6.dp),
             )
-        }
-
-        // 字幕状态提示（仅实时 ASR 模式下显示；离线字幕无需加载提示）
-        if (subtitleSource == SubtitleSource.REALTIME && asrStatus != SubtitleAsrEngine.Status.READY) {
-            val label = when (asrStatus) {
-                SubtitleAsrEngine.Status.LOADING -> "字幕模型加载中…"
-                SubtitleAsrEngine.Status.ERROR -> "字幕引擎出错（请重开字幕）"
-                else -> ""
-            }
-            if (label.isNotEmpty()) {
-                Text(
-                    text = label,
-                    color = Color(0xFFFFD54F),
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier
-                        .align(Alignment.TopCenter)
-                        .padding(top = 96.dp)
-                        .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
-                        .padding(horizontal = 12.dp, vertical = 6.dp),
-                )
-            }
         }
 
         // ---- 手势 HUD：居中胶囊 + 进度条 ----
