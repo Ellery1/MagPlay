@@ -18,6 +18,13 @@ sealed interface FileOpResult {
     data class Failed(val message: String) : FileOpResult
 }
 
+/** 目录批量操作结果（R1）。 */
+sealed interface DirOpResult {
+    data class Ok(val count: Int) : DirOpResult
+    data class NeedPermission(val uris: List<Uri>) : DirOpResult
+    data class Failed(val message: String, val okCount: Int, val failCount: Int) : DirOpResult
+}
+
 /**
  * 视频文件的移动与删除（连同同名字幕）。
  *
@@ -27,6 +34,81 @@ sealed interface FileOpResult {
  * 若用户在系统设置里给了「所有文件访问权限」（MANAGE_EXTERNAL_STORAGE），则不会再弹窗。
  */
 object VideoFiles {
+
+    /**
+     * R1：重命名目录 —— 把 [dirPath] 及其子目录下所有视频移动到「父目录/新名」下。
+     * 逐条复用 [move]（字幕跟随、引擎记录同步、重名自动加序号）。
+     */
+    fun renameDir(
+        context: Context,
+        allVideos: List<VideoItem>,
+        dirPath: String,
+        newName: String,
+    ): DirOpResult {
+        val name = newName.trim().trim('/')
+        if (name.isEmpty() || name.contains('/')) {
+            return DirOpResult.Failed("名称不能为空，也不能包含 /", 0, 0)
+        }
+        val old = dirPath.trim('/')
+        if (old.isEmpty()) return DirOpResult.Failed("根目录不能重命名", 0, 0)
+        val parent = old.substringBeforeLast('/', "")
+        val newPrefix = if (parent.isEmpty()) name else "$parent/$name"
+
+        val affected = allVideos.filter {
+            val p = it.relativePath.trim('/')
+            p == old || p.startsWith("$old/")
+        }
+        if (affected.isEmpty()) return DirOpResult.Ok(0)
+
+        val uris = mutableListOf<Uri>()
+        var ok = 0
+        var fail = 0
+        for (v in affected) {
+            val rest = v.relativePath.trim('/').removePrefix(old).trimStart('/')
+            val target = if (rest.isEmpty()) newPrefix else "$newPrefix/$rest"
+            when (val r = move(context, v, target)) {
+                is FileOpResult.Ok -> ok++
+                is FileOpResult.NeedPermission -> uris.addAll(r.uris)
+                is FileOpResult.Failed -> fail++
+            }
+        }
+        return when {
+            uris.isNotEmpty() -> DirOpResult.NeedPermission(uris)
+            fail == 0 -> DirOpResult.Ok(ok)
+            else -> DirOpResult.Failed("$fail 个文件失败（成功 $ok 个）", ok, fail)
+        }
+    }
+
+    /** R1：删除目录 —— 删除 [dirPath] 及其子目录下所有视频（含同名 .srt）。 */
+    fun deleteDir(
+        context: Context,
+        allVideos: List<VideoItem>,
+        dirPath: String,
+    ): DirOpResult {
+        val old = dirPath.trim('/')
+        if (old.isEmpty()) return DirOpResult.Failed("根目录不能删除", 0, 0)
+        val affected = allVideos.filter {
+            val p = it.relativePath.trim('/')
+            p == old || p.startsWith("$old/")
+        }
+        if (affected.isEmpty()) return DirOpResult.Ok(0)
+
+        val uris = mutableListOf<Uri>()
+        var ok = 0
+        var fail = 0
+        for (v in affected) {
+            when (val r = delete(context, v)) {
+                is FileOpResult.Ok -> ok++
+                is FileOpResult.NeedPermission -> uris.addAll(r.uris)
+                is FileOpResult.Failed -> fail++
+            }
+        }
+        return when {
+            uris.isNotEmpty() -> DirOpResult.NeedPermission(uris)
+            fail == 0 -> DirOpResult.Ok(ok)
+            else -> DirOpResult.Failed("$fail 个文件失败（成功 $ok 个）", ok, fail)
+        }
+    }
 
     /** 移动视频到目标目录（RELATIVE_PATH 形式，如 Download/ThunderDownload/）。 */
     fun move(context: Context, item: VideoItem, targetDir: String): FileOpResult {

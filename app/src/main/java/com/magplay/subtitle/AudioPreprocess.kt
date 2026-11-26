@@ -47,15 +47,20 @@ object AudioPreprocess {
         }
     }
 
-    /** 按段归一化音量。返回新数组，不改原数组（原数组还要留给其他用途时更安全）。 */
-    fun normalize(samples: FloatArray): FloatArray {
+    /**
+     * 按段归一化音量。返回新数组，不改原数组（原数组还要留给其他用途时更安全）。
+     *
+     * @param maxGain 增益上限。默认 6 倍适合正常语段；VAD 盲区里的人声被背景音压到
+     *   RMS≈0.005，6 倍只能抬到 0.03，模型仍听不见——兜底识别要用更大的上限。
+     */
+    fun normalize(samples: FloatArray, maxGain: Float = MAX_GAIN): FloatArray {
         if (samples.isEmpty()) return samples
         var sum = 0.0
         for (v in samples) sum += v.toDouble() * v
         val rms = sqrt(sum / samples.size).toFloat()
         // 近乎全静音：不动，交给 VAD 判定
         if (rms < 1e-5f) return samples
-        val gain = (TARGET_RMS / rms).coerceIn(MIN_GAIN, MAX_GAIN)
+        val gain = (TARGET_RMS / rms).coerceIn(MIN_GAIN, maxGain)
         if (abs(gain - 1f) < 0.02f) return samples
         val out = FloatArray(samples.size)
         for (i in samples.indices) out[i] = (samples[i] * gain).coerceIn(-1f, 1f)

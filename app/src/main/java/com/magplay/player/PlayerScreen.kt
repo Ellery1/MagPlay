@@ -15,6 +15,9 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
@@ -65,6 +68,7 @@ import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.magplay.data.AppLog
+import com.magplay.data.PlaybackProgress
 import com.magplay.data.VideoItem
 import com.magplay.subtitle.SrtCue
 import com.magplay.subtitle.SrtFile
@@ -114,18 +118,24 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
     } else 0
     val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
 
-    // 横屏播放；亮度是本 Activity 私有的，退出时恢复进入前的值
+    // 横屏播放；亮度是本 Activity 私有的，退出时恢复进入前的值。
+    // R10：播放页活跃期间（含暂停）全程保屏，退出即释放，与旋转/亮度恢复同一 Effect。
     DisposableEffect(Unit) {
         val previousOrientation = activity?.requestedOrientation
         val originalBrightness = activity?.window?.attributes?.screenBrightness
             ?: WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
         activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        val window = activity?.window
+        window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        AppLog.i("Player", "保屏已开启：${item.name}")
         onDispose {
             if (previousOrientation != null) activity.requestedOrientation = previousOrientation
             activity?.window?.attributes?.let { lp ->
                 lp.screenBrightness = originalBrightness
                 activity.window.attributes = lp
             }
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            AppLog.i("Player", "保屏已释放：${item.name}")
         }
     }
 
@@ -137,6 +147,9 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
     var offlineCues by remember { mutableStateOf<List<SrtCue>>(emptyList()) }
     var offlineBad by remember { mutableStateOf(false) }
     val hasOffline = offlineCues.isNotEmpty()
+
+    // R8：断点续播只 seek 一次（STATE_READY 首帧），避免 prepare 回调抖动导致来回跳
+    var resumeDone by remember { mutableStateOf(false) }
 
     val player = remember(item.uri) {
         ExoPlayer.Builder(context).build().apply {
@@ -160,13 +173,43 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_READY) {
                     AppLog.i("Player", "就绪 ${item.name}，时长 ${player.duration}ms")
+                    if (!resumeDone) {
+                        resumeDone = true
+                        val pos = PlaybackProgress.load(context, item.id, player.duration)
+                        if (pos > 0L) {
+                            player.seekTo(pos)
+                            AppLog.i("Player", "断点续播 ${item.name} -> ${pos / 1000}s")
+                        }
+                    }
+                }
+                if (playbackState == Player.STATE_ENDED) {
+                    PlaybackProgress.clear(context, item.id)
+                    AppLog.i("Player", "播放完成，清除进度：${item.name}")
                 }
             }
         }
         player.addListener(listener)
         onDispose {
             player.removeListener(listener)
+            // 退出时兜底保存（播放中每 3 秒也存一次）
+            if (player.duration > 0 && player.currentPosition > 0 &&
+                player.playbackState != Player.STATE_ENDED
+            ) {
+                PlaybackProgress.save(context, item.id, player.currentPosition, player.duration)
+            }
             player.release()
+        }
+    }
+
+    // R8：播放中每 3 秒保存一次，防强杀/崩溃丢进度
+    LaunchedEffect(item.id) {
+        while (true) {
+            delay(3000)
+            if (player.duration > 0 && player.currentPosition > 0 &&
+                player.playbackState != Player.STATE_ENDED
+            ) {
+                PlaybackProgress.save(context, item.id, player.currentPosition, player.duration)
+            }
         }
     }
 
@@ -179,6 +222,23 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
     fun revealControls() {
         controlsVisible = true
         controlsSeq++
+    }
+
+    // R7：控制条显隐时同步显隐系统状态栏（时间 / 通知 / 电量）。
+    // 进入播放页默认隐藏；退出时用 onDispose 恢复，避免影响列表页。
+    val insetController = remember {
+        activity?.window?.let { WindowInsetsControllerCompat(it, it.decorView) }
+    }
+    DisposableEffect(controlsVisible) {
+        if (controlsVisible) {
+            insetController?.show(WindowInsetsCompat.Type.statusBars())
+        } else {
+            insetController?.hide(WindowInsetsCompat.Type.statusBars())
+        }
+        onDispose { }
+    }
+    DisposableEffect(Unit) {
+        onDispose { insetController?.show(WindowInsetsCompat.Type.statusBars()) }
     }
 
     // ---- 画面旋转：两态往复 —— 首次逆时针 90°（竖屏），再点顺时针 90°（回横屏），如此循环 ----
@@ -343,6 +403,8 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
                 val topExcludePx = 68f * density
                 val bottomExcludePx = 72f * density
                 val dragLockPx = 14f * density
+                // R9：中央播放/暂停按钮的感应区（显示尺寸不变，热区放大到 96dp）
+                val centerHotPx = 96f * density
 
                 // 倍率提示常驻（sticky）：长按还在就一直显示，松手才消失
                 val speedHint: (Float) -> Unit = { s ->
@@ -404,8 +466,10 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
                         findViewById<android.view.View>(androidx.media3.ui.R.id.exo_pause)?.let {
                             it.scaleX = 1.7f; it.scaleY = 1.7f
                         }
-                        // 中央播放/暂停按钮只作状态指示，不再消费触摸：
-                        // 否则双击落在它上面会变成"点两下按钮"（暂停→立刻恢复），双击手势失效。
+                        // 中央播放/暂停按钮保留显示，但触摸由 PlayerView 的 onTouchListener 统一接管：
+                        // 单击落在 96dp 中心热区 → 切播放/暂停；双击落在热区 → 只在双击判定时切一次，
+                        // 不会变成"点两下按钮"（暂停→立刻恢复）。若让 media3 按钮自己消费点击，
+                        // 双击手势就会失效，所以这里仍禁用其 clickable。
                         findViewById<android.view.View>(androidx.media3.ui.R.id.exo_play_pause)?.let {
                             it.isClickable = false
                             it.isFocusable = false
@@ -535,12 +599,17 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
                                         now - lastTapMs < 300L &&
                                         abs(event.x - lastTapX) < tapSlop &&
                                         abs(event.y - lastTapY) < tapSlop
+                                    // R9：96dp 中心热区内的单击 = 播放/暂停；区外单击 = 切控制条。
+                                    val inCenterHot = (view.width > 0 && view.height > 0) &&
+                                        abs(event.x - view.width / 2f) <= centerHotPx / 2f &&
+                                        abs(event.y - view.height / 2f) <= centerHotPx / 2f
                                     if (isDoubleTap) {
-                                        // 双击：取消待执行的单击，切播放/暂停
+                                        // 双击：取消待执行的单击，切播放/暂停（只切一次）
                                         singleTapRunnable?.let { handler.removeCallbacks(it) }
                                         singleTapRunnable = null
                                         lastTapMs = 0L
                                         togglePlayPause()
+                                        revealControls()
                                     } else {
                                         // 单击延迟 300ms 执行，给第二击留出判定窗口，避免双击时控件闪一下
                                         lastTapMs = now
@@ -549,12 +618,18 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
                                         val action = Runnable {
                                             singleTapRunnable = null
                                             lastTapMs = 0L
-                                            controlsVisible = !controlsVisible
-                                            if (controlsVisible) {
-                                                controlsSeq++
-                                                showController()
+                                            if (inCenterHot) {
+                                                togglePlayPause()
+                                                revealControls()
+                                                AppLog.i("Player", "中央按钮 -> playWhenReady=${player.playWhenReady}")
                                             } else {
-                                                hideController()
+                                                controlsVisible = !controlsVisible
+                                                if (controlsVisible) {
+                                                    controlsSeq++
+                                                    showController()
+                                                } else {
+                                                    hideController()
+                                                }
                                             }
                                         }
                                         singleTapRunnable = action

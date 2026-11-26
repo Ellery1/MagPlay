@@ -108,7 +108,15 @@ object SubtitleLineBreaker {
             }
         }
         val tail = sb.toString().trim()
-        if (tail.isNotEmpty()) out += tail
+        if (tail.isNotEmpty()) {
+            // R5：硬切后剩下的零星尾字（如只有"风"一个字）并入上一条，
+            // 避免闪现一条单字字幕——既读不完也像漏字。没有上一条时原样保留。
+            if (tail.length < 4 && out.isNotEmpty()) {
+                out[out.lastIndex] = out.last() + tail
+            } else {
+                out += tail
+            }
+        }
         return out.filter { it.isNotEmpty() }
     }
 

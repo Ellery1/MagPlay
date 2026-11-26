@@ -44,6 +44,7 @@ import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Article
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.DriveFileMove
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Folder
@@ -66,8 +67,10 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -95,6 +98,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import com.magplay.data.AppLog
+import com.magplay.data.DirOpResult
 import com.magplay.data.FileOpResult
 import com.magplay.asr.AsrModels
 import com.magplay.data.PowerGuard
@@ -105,6 +109,7 @@ import com.magplay.data.VideoRename
 import com.magplay.data.VideoScanner
 import com.magplay.subtitle.GenAttempts
 import com.magplay.subtitle.AsrSettings
+import com.magplay.subtitle.ModelDownloader
 import com.magplay.subtitle.SubtitleGenerationService
 import com.magplay.subtitle.SubtitleStore
 import kotlinx.coroutines.Dispatchers
@@ -126,6 +131,8 @@ fun VideoListScreen(
     onSelect: (VideoItem) -> Unit,
     onRefresh: () -> Unit,
     onOpenLogs: () -> Unit = {},
+    /** R6：播放页/日志页覆盖在本页之上时，禁用返回键拦截与手势，避免抢事件。 */
+    paused: Boolean = false,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -138,6 +145,16 @@ fun VideoListScreen(
     var renameTarget by remember { mutableStateOf<VideoItem?>(null) }
     var showGenSubtitleDialog by remember { mutableStateOf(false) }
     var showRegenerateConfirm by remember { mutableStateOf(false) }
+    // R4：模型下载 / 未安装引导
+    var showModelDialog by remember { mutableStateOf(false) }
+    var installedVersion by remember { mutableIntStateOf(if (ModelDownloader.isInstalled(context)) 1 else 0) }
+    val modelReady = installedVersion > 0
+    val dlState by ModelDownloader.state.collectAsState()
+    LaunchedEffect(dlState) {
+        if (dlState is ModelDownloader.State.Installed && ModelDownloader.isInstalled(context)) {
+            installedVersion = 1
+        }
+    }
     // 非 null 表示弹了"锁屏继续"引导框，值是本次要启动的 force 标记
     var pendingGenForce by remember { mutableStateOf<Boolean?>(null) }
     val searching = query.isNotBlank()
@@ -172,11 +189,48 @@ fun VideoListScreen(
     var deleteTarget by remember { mutableStateOf<VideoItem?>(null) }
     var pendingOp by remember { mutableStateOf<PendingFileOp?>(null) }
     var genPlanText by remember { mutableStateOf<String?>(null) }
+    // R1：文件夹菜单 / 重命名 / 删除
+    var dirActionTarget by remember { mutableStateOf<String?>(null) }
+    var dirRenameTarget by remember { mutableStateOf<String?>(null) }
+    var dirRenameValue by remember { mutableStateOf("") }
+    var dirDeleteTarget by remember { mutableStateOf<String?>(null) }
+    var pendingDirOp by remember { mutableStateOf<PendingDirOp?>(null) }
 
     // 系统授权弹窗（"允许 MagPlay 修改/删除此文件？"）回来后重试一次
     val permLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult(),
     ) { res ->
+        val dirOp = pendingDirOp
+        if (dirOp != null) {
+            pendingDirOp = null
+            if (res.resultCode == Activity.RESULT_OK) {
+                val result = when (dirOp) {
+                    is PendingDirOp.Rename ->
+                        VideoFiles.renameDir(context, videosState.value, dirOp.dir, dirOp.newName)
+                    is PendingDirOp.Delete ->
+                        VideoFiles.deleteDir(context, videosState.value, dirOp.dir)
+                }
+                when (result) {
+                    is DirOpResult.Ok -> {
+                        Toast.makeText(
+                            context,
+                            if (dirOp is PendingDirOp.Rename) "已重命名 ${result.count} 个视频"
+                            else "已删除 ${result.count} 个视频及字幕",
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                        currentDir = currentDir.substringBeforeLast("/", "")
+                        scope.launch { onRefresh() }
+                    }
+                    is DirOpResult.NeedPermission ->
+                        Toast.makeText(context, "系统仍未放行这些文件", Toast.LENGTH_SHORT).show()
+                    is DirOpResult.Failed ->
+                        Toast.makeText(context, result.message, Toast.LENGTH_LONG).show()
+                }
+            } else {
+                Toast.makeText(context, "未授权，操作已取消", Toast.LENGTH_SHORT).show()
+            }
+            return@rememberLauncherForActivityResult
+        }
         val op = pendingOp
         pendingOp = null
         if (op != null) {
@@ -252,6 +306,62 @@ fun VideoListScreen(
             }
             is FileOpResult.NeedPermission -> requestPermission(video, null, r.uris)
             is FileOpResult.Failed -> Toast.makeText(context, r.message, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /** R4：所有生成入口的统一守卫 —— 模型未装时引导下载，不启动生成。 */
+    fun requireModel(onReady: () -> Unit) {
+        when {
+            ModelDownloader.isInstalled(context) -> onReady()
+            dlState is ModelDownloader.State.Downloading ->
+                Toast.makeText(context, "模型正在下载，完成后再试", Toast.LENGTH_SHORT).show()
+            else -> showModelDialog = true
+        }
+    }
+
+    fun launchDirPermission(uris: List<android.net.Uri>) {
+        val sender = runCatching {
+            val resolver = context.contentResolver
+            // 重命名要写、删除要删；统一用 write 请求，多数情形可覆盖，
+            // 真遇到 delete 被拒时系统会在重试时再提示。
+            android.provider.MediaStore.createWriteRequest(resolver, uris).intentSender
+        }.getOrNull()
+        if (sender == null) {
+            pendingDirOp = null
+            Toast.makeText(context, "当前系统不支持逐次授权，请授予「所有文件访问权限」", Toast.LENGTH_LONG).show()
+        } else {
+            permLauncher.launch(IntentSenderRequest.Builder(sender).build())
+        }
+    }
+
+    /** R1：目录批量重命名 / 删除。授权不足时走 pendingDirOp，授权回来后重试。 */
+    fun doDirRename(dir: String, newName: String) {
+        when (val r = VideoFiles.renameDir(context, videosState.value, dir, newName)) {
+            is DirOpResult.Ok -> {
+                Toast.makeText(context, "已重命名 ${r.count} 个视频", Toast.LENGTH_SHORT).show()
+                currentDir = currentDir.substringBeforeLast("/", "")
+                scope.launch { onRefresh() }
+            }
+            is DirOpResult.NeedPermission -> {
+                pendingDirOp = PendingDirOp.Rename(dir, newName)
+                launchDirPermission(r.uris)
+            }
+            is DirOpResult.Failed -> Toast.makeText(context, r.message, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    fun doDirDelete(dir: String) {
+        when (val r = VideoFiles.deleteDir(context, videosState.value, dir)) {
+            is DirOpResult.Ok -> {
+                Toast.makeText(context, "已删除 ${r.count} 个视频及字幕", Toast.LENGTH_SHORT).show()
+                currentDir = currentDir.substringBeforeLast("/", "")
+                scope.launch { onRefresh() }
+            }
+            is DirOpResult.NeedPermission -> {
+                pendingDirOp = PendingDirOp.Delete(dir)
+                launchDirPermission(r.uris)
+            }
+            is DirOpResult.Failed -> Toast.makeText(context, r.message, Toast.LENGTH_LONG).show()
         }
     }
 
@@ -358,7 +468,7 @@ fun VideoListScreen(
 
     // 系统返回键/边缘右滑手势：先在子目录内逐级回退，到根目录才退出 App。
     // 这样边缘右滑不会被系统直接 finish，而是走这里回上级。
-    BackHandler(enabled = currentDir.isNotEmpty() || searching) {
+    BackHandler(enabled = !paused && (currentDir.isNotEmpty() || searching)) {
         if (searching) {
             query = ""
             selectedType = null
@@ -423,8 +533,8 @@ fun VideoListScreen(
         modifier = Modifier
             .fillMaxSize()
             .onGloballyPositioned { rootOrigin = it.positionInWindow() }
-            .pointerInput(currentDir, searching) {
-                if (currentDir.isEmpty() || searching) return@pointerInput
+            .pointerInput(currentDir, searching, paused) {
+                if (paused || currentDir.isEmpty() || searching) return@pointerInput
                 var totalDx = 0f
                 detectHorizontalDragGestures(
                     onDragStart = { totalDx = 0f },
@@ -435,7 +545,8 @@ fun VideoListScreen(
                     onDragCancel = { totalDx = 0f },
                 )
             }
-            .pointerInput(Unit) {
+            .pointerInput(paused) {
+                if (paused) return@pointerInput
                 // 长按弹菜单 / 长按拖动移动。
                 // 挂在根节点上（列表的父级）：事件一定经过这里，且列表行被 LazyColumn 回收时
                 // 手势不会被连带取消——拖到顶部回上一级时正是这种场景。
@@ -448,7 +559,13 @@ fun VideoListScreen(
                         .firstOrNull { it.value.contains(down.position + rootOrigin) }
                         ?.key
                         ?.let { id -> videosState.value.firstOrNull { it.id == id } }
-                    if (hitVideo == null) return@awaitEachGesture
+                    // R1：文件夹命中（视频优先；没命中视频时才看文件夹）
+                    val hitDirName = if (hitVideo == null) {
+                        dirRects.entries.firstOrNull {
+                            it.value.contains(down.position + rootOrigin)
+                        }?.key
+                    } else null
+                    if (hitVideo == null && hitDirName == null) return@awaitEachGesture
 
                     // 三种结局：
                     // ① 按住不动到点 → 长按菜单
@@ -492,12 +609,18 @@ fun VideoListScreen(
                             if (!ch.pressed) break
                         }
                         haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                        actionTarget = hitVideo
+                        if (hitVideo != null) actionTarget = hitVideo
+                        else if (hitDirName != null) dirActionTarget = fullDirPath(currentDir, hitDirName)
                         return@awaitEachGesture
                     }
                     if (!longPressed) return@awaitEachGesture
 
                     haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                    if (hitVideo == null && hitDirName != null) {
+                        // 文件夹：长按只弹菜单，不进入拖拽移动
+                        dirActionTarget = fullDirPath(currentDir, hitDirName)
+                        return@awaitEachGesture
+                    }
                     dragVideo = hitVideo
                     dragMoved = false
                     dragPos = down.position + rootOrigin
@@ -569,7 +692,16 @@ fun VideoListScreen(
                         )
                     }
                 }
-                IconButton(onClick = { showGenSubtitleDialog = true }) {
+                // R4：模型下载入口（已装时打勾提示）
+                IconButton(onClick = { showModelDialog = true }) {
+                    Icon(
+                        Icons.Filled.Download,
+                        contentDescription = "下载离线字幕模型",
+                        tint = if (modelReady) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                IconButton(onClick = { requireModel { showGenSubtitleDialog = true } }) {
                     Icon(Icons.Filled.Subtitles, contentDescription = "生成离线字幕")
                 }
                 IconButton(onClick = onRefresh) {
@@ -787,6 +919,92 @@ fun VideoListScreen(
         }
     }
 
+    // ---- R1：文件夹长按菜单 ----
+    dirActionTarget?.let { dir ->
+        val count = videosState.value.count {
+            val p = it.relativePath.trim('/')
+            p == dir.trim('/') || p.startsWith("${dir.trim('/')}/")
+        }
+        AlertDialog(
+            onDismissRequest = { dirActionTarget = null },
+            title = { Text(dir.substringAfterLast("/"), style = MaterialTheme.typography.titleSmall) },
+            text = {
+                Column {
+                    Text("该文件夹含 $count 个视频", style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.height(4.dp))
+                    MenuRow(Icons.Filled.Edit, "重命名文件夹") {
+                        dirActionTarget = null
+                        dirRenameValue = dir.substringAfterLast("/")
+                        dirRenameTarget = dir
+                    }
+                    MenuRow(Icons.Filled.Delete, "删除文件夹及其中全部文件", danger = true) {
+                        dirActionTarget = null
+                        dirDeleteTarget = dir
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = { dirActionTarget = null }) { Text("取消") } },
+        )
+    }
+
+    // ---- R1：文件夹重命名输入 ----
+    dirRenameTarget?.let { dir ->
+        AlertDialog(
+            onDismissRequest = { dirRenameTarget = null },
+            title = { Text("重命名文件夹") },
+            text = {
+                Column {
+                    Text("该文件夹及子目录下的视频会移动到新目录，字幕同步跟随。",
+                        style = MaterialTheme.typography.bodySmall)
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = dirRenameValue,
+                        onValueChange = { dirRenameValue = it },
+                        label = { Text("新名称") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val name = dirRenameValue.trim()
+                    dirRenameTarget = null
+                    if (name.isNotEmpty()) doDirRename(dir, name)
+                }) { Text("确定") }
+            },
+            dismissButton = { TextButton(onClick = { dirRenameTarget = null }) { Text("取消") } },
+        )
+    }
+
+    // ---- R1：文件夹删除二次确认 ----
+    dirDeleteTarget?.let { dir ->
+        val count = videosState.value.count {
+            val p = it.relativePath.trim('/')
+            p == dir.trim('/') || p.startsWith("${dir.trim('/')}/")
+        }
+        AlertDialog(
+            onDismissRequest = { dirDeleteTarget = null },
+            title = { Text("删除文件夹？") },
+            text = {
+                Text(
+                    "将物理删除「${dir.substringAfterLast("/")}」及其子目录中的 $count 个视频和同名字幕，无法恢复。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    dirDeleteTarget = null
+                    doDirDelete(dir)
+                }) { Text("删除") }
+            },
+            dismissButton = { TextButton(onClick = { dirDeleteTarget = null }) { Text("取消") } },
+        )
+    }
+
     // ---- 长按菜单：本视频字幕 / 重命名 / 删除 ----
     actionTarget?.let { target ->
         AlertDialog(
@@ -808,19 +1026,21 @@ fun VideoListScreen(
                         if (hasSrt) "重新生成这个视频的字幕" else "为这个视频生成字幕",
                     ) {
                         actionTarget = null
-                        if (SubtitleGenerationService.isRunning()) {
-                            Toast.makeText(
-                                context,
-                                "已有字幕任务在跑，等它结束或点通知栏的取消",
-                                Toast.LENGTH_SHORT,
-                            ).show()
-                        } else {
-                            SubtitleGenerationService.startSingle(context, target.id)
-                            Toast.makeText(
-                                context,
-                                if (hasSrt) "已开始重新生成，进度见通知栏" else "已开始生成字幕，进度见通知栏",
-                                Toast.LENGTH_SHORT,
-                            ).show()
+                        requireModel {
+                            if (SubtitleGenerationService.isRunning()) {
+                                Toast.makeText(
+                                    context,
+                                    "已有字幕任务在跑，等它结束或点通知栏的取消",
+                                    Toast.LENGTH_SHORT,
+                                ).show()
+                            } else {
+                                SubtitleGenerationService.startSingle(context, target.id)
+                                Toast.makeText(
+                                    context,
+                                    if (hasSrt) "已开始重新生成，进度见通知栏" else "已开始生成字幕，进度见通知栏",
+                                    Toast.LENGTH_SHORT,
+                                ).show()
+                            }
                         }
                     }
                     MenuRow(Icons.Filled.Edit, "重命名") {
@@ -891,9 +1111,49 @@ fun VideoListScreen(
         )
     }
 
-    // ---- 识别引擎选择：可用模型列表（外部目录里有什么就显示什么）----
-    val engines = remember { AsrModels.available(context) }
-    var engine by remember { mutableStateOf(AsrSettings.backend(context)) }
+    // ---- R4：模型下载 / 未安装引导 ----
+    if (showModelDialog) {
+        val busy = dlState is ModelDownloader.State.Downloading
+        AlertDialog(
+            onDismissRequest = { if (!busy) showModelDialog = false },
+            title = { Text(if (modelReady) "字幕模型已安装" else "安装离线字幕模型") },
+            text = {
+                Column {
+                    Text(
+                        if (modelReady) "FireRedASR2 AED 已就绪，可直接生成离线字幕。"
+                        else "字幕在本机生成，不联网。需先安装 FireRedASR2 AED 模型（约 1.2GB），建议在 WiFi 下下载。",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    when (val s = dlState) {
+                        is ModelDownloader.State.Downloading -> Text(
+                            "下载 ${s.fileName}（${s.fileIndex}/${s.fileCount}）${s.percent}%",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        is ModelDownloader.State.Failed -> Text(
+                            "失败：${s.message}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                        else -> Unit
+                    }
+                }
+            },
+            confirmButton = {
+                when {
+                    modelReady -> TextButton(onClick = { showModelDialog = false }) { Text("知道了") }
+                    busy -> TextButton(onClick = { ModelDownloader.cancel() }) { Text("取消下载") }
+                    else -> TextButton(onClick = {
+                        scope.launch { ModelDownloader.install(context) }
+                    }) { Text("开始下载") }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showModelDialog = false }, enabled = !busy) { Text("关闭") }
+            },
+        )
+    }
 
     // ---- 生成离线字幕：两个入口（全量补齐 / 清空重做）----
     if (showGenSubtitleDialog) {
@@ -912,43 +1172,6 @@ fun VideoListScreen(
                             it,
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.primary,
-                        )
-                    }
-
-                    // 识别引擎：只有 Paraformer 内置，其余从 files/models 加载
-                    Spacer(Modifier.height(14.dp))
-                    Text(
-                        "识别引擎",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Spacer(Modifier.height(6.dp))
-                    Row(
-                        modifier = Modifier.horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        engines.forEach { b ->
-                            FilterChip(
-                                selected = engine == b,
-                                onClick = {
-                                    engine = b
-                                    AsrSettings.setBackend(context, b)
-                                },
-                                label = { Text(b.label, style = MaterialTheme.typography.labelMedium) },
-                            )
-                        }
-                    }
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        engine.note,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    if (engines.size == 1) {
-                        Text(
-                            "更多模型可用 dist/push_models.sh 推入后自动出现",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
 
@@ -1244,6 +1467,15 @@ private fun formatSize(bytes: Long): String = when {
 
 /** 待系统授权后重试的文件操作：targetDir 为 null 表示删除。 */
 private data class PendingFileOp(val video: VideoItem, val targetDir: String?)
+
+/** R1：等待系统授权后重试的目录批量操作。 */
+private sealed interface PendingDirOp {
+    data class Rename(val dir: String, val newName: String) : PendingDirOp
+    data class Delete(val dir: String) : PendingDirOp
+}
+
+private fun fullDirPath(current: String, name: String): String =
+    if (current.isEmpty()) name.trim('/') else "${current.trim('/')}/${name.trim('/')}"
 
 /** 长按菜单里的一行。 */
 @Composable

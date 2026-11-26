@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- R4：仅对模型下载服务器放通明文 HTTP，其余域名/IP 仍禁止明文。 -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">47.103.215.190</domain>
+    </domain-config>
+</network-security-config>

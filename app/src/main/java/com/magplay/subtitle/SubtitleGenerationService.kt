@@ -275,8 +275,11 @@ class SubtitleGenerationService : Service() {
             // 模型整批只加载一次（重操作，切到 Default 线程，避免卡主线程）
             withContext(Dispatchers.Default) {
                 updateNotification("加载 ${backend.label} 模型（约 ${backend.sizeMb}MB）…", 0, true)
-                generator = OfflineSubtitleGenerator(this@SubtitleGenerationService, backend)
-                    .also { it.prepare() }
+                generator = OfflineSubtitleGenerator(
+                    this@SubtitleGenerationService,
+                    backend,
+                    onDiagnostic = { fileLog(it) },
+                ).also { it.prepare() }
             }
             val gen = generator ?: run {
                 updateNotification("模型加载失败", 0, false)

@@ -8,6 +8,8 @@ data class SrtCue(
     val startMs: Long,
     val endMs: Long,
     val text: String,
+    /** 直通识别时的 5s 窗口序号；仅用于合并分组，普通 VAD 条目为 -1。 */
+    val windowId: Int = -1,
 )
 
 /**

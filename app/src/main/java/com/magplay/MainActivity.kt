@@ -9,6 +9,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
@@ -23,6 +24,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.content.ContextCompat
 import com.magplay.data.AppLog
+import com.magplay.data.PlaybackProgress
 import com.magplay.data.VideoItem
 import com.magplay.data.VideoScanner
 import com.magplay.player.PlayerScreen
@@ -92,6 +94,8 @@ class MainActivity : ComponentActivity() {
             } else {
                 val started = System.currentTimeMillis()
                 val list = VideoScanner.scan(context)
+                // R8：清理已删除视频的播放进度记录
+                PlaybackProgress.prune(context, list.map { it.id }.toSet())
                 AppLog.i("Scan", "扫描完成：${list.size} 个视频，耗时 ${System.currentTimeMillis() - started}ms")
                 list
             }
@@ -99,10 +103,10 @@ class MainActivity : ComponentActivity() {
 
         var selected by remember { mutableStateOf<VideoItem?>(null) }
         val current = selected
-        when {
-            showLogs -> LogScreen(onBack = { showLogs = false })
-            current != null -> PlayerScreen(item = current, onBack = { selected = null })
-            else -> VideoListScreen(
+        // R6：列表页常驻组合树，播放页/日志页覆盖其上。
+        // 这样 currentDir、搜索词与 LazyColumn 滚动位置在进出视频时天然保留。
+        Box(modifier = Modifier.fillMaxSize()) {
+            VideoListScreen(
                 videos = videos,
                 onSelect = {
                     AppLog.i("Open", "播放 ${it.name}（${it.durationMs / 1000}s，${it.relativePath}）")
@@ -113,7 +117,12 @@ class MainActivity : ComponentActivity() {
                     refreshKey++
                 },
                 onOpenLogs = { showLogs = true },
+                paused = showLogs || current != null,
             )
+            if (showLogs) LogScreen(onBack = { showLogs = false })
+            if (current != null) {
+                PlayerScreen(item = current, onBack = { selected = null })
+            }
         }
     }
 

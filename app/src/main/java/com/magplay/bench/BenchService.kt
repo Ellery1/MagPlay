@@ -40,6 +40,7 @@ class BenchService : Service() {
         // 屏幕一关 MIUI 会把进程冻住（日志：Sending oneway calls to frozen process），
         // 和字幕生成踩的是同一个坑，这里同样必须持唤醒锁。
         acquireWakeLock()
+
         val path = intent?.getStringExtra(EXTRA_PATH)
         if (path.isNullOrBlank() || !File(path).isFile) {
             notify("素材不存在：$path")
@@ -53,7 +54,7 @@ class BenchService : Service() {
         val backends = (ids ?: AsrModels.available(this).map { it.id })
             .map { AsrBackend.fromId(it) }
             .filter { AsrModels.isAvailable(this, it) }
-            .ifEmpty { listOf(AsrBackend.PARAFORMER) }
+            .ifEmpty { listOf(AsrBackend.FIRERED_AED) }
 
         Log.i(TAG, "bench start: $path sec=$seconds models=${backends.map { it.id }}")
         scope.launch {
