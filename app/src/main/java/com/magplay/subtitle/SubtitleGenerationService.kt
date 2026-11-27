@@ -126,6 +126,9 @@ class SubtitleGenerationService : Service() {
     override fun onTimeout(startId: Int, fgsType: Int) {
         fileLog("onTimeout fgsType=$fgsType -> graceful stop")
         cancelled.set(true)
+        // 立即落盘：超时后进程随时被系统回收，不能等 runBatch 的 finally 慢慢刷状态。
+        RUNNING.set(false)
+        publishStatus("已达系统 6 小时上限，已暂停。回到 App 再点一次可继续", force = true)
         try {
             updateNotification("已达系统 6 小时上限，已暂停。回到 App 再点一次可继续", 100, false)
         } catch (_: Throwable) {
@@ -192,7 +195,7 @@ class SubtitleGenerationService : Service() {
             // 引擎要在扫描前确定：待办判定依赖"这份字幕是不是当前引擎生成的"
             val backend = AsrSettings.backend(this@SubtitleGenerationService)
             fileLog("engine: ${backend.id} (${backend.label})")
-            val (all, pending) = if (onlyId > 0) {
+            val (all, pendingInit) = if (onlyId > 0) {
                 // 单视频模式：只按 id 精确取一条，不扫全量
                 val one = withContext(Dispatchers.IO) {
                     VideoScanner.findById(this@SubtitleGenerationService, onlyId)
@@ -261,10 +264,40 @@ class SubtitleGenerationService : Service() {
                     scanned to todo
                 }
             }
-            Log.i(TAG, "batch start: total=${all.size} pending=${pending.size}")
+            var pending = pendingInit
+            // 带字幕轨的视频（容器自带软字幕，如 text/3gpp-tt）无需 ASR 生成。
+            // 放在加载模型之前过滤：省下几百 MB 模型加载 + 整段解码识别。
+            // 只读取容器轨道头，每个视频几毫秒。
+            var skippedByTrack = 0
+            if (pending.isNotEmpty()) {
+                val withoutTrack = mutableListOf<VideoItem>()
+                for (video in pending) {
+                    val hasTrack = withContext(Dispatchers.IO) {
+                        SubtitleTrackDetector.hasTextTrack(
+                            this@SubtitleGenerationService, video.uri,
+                        )
+                    }
+                    if (hasTrack) {
+                        skippedByTrack++
+                        fileLog("skip built-in subtitle track: ${video.name}")
+                    } else {
+                        withoutTrack.add(video)
+                    }
+                }
+                pending = withoutTrack
+                if (skippedByTrack > 0) {
+                    fileLog("skipped by subtitle track: $skippedByTrack")
+                }
+            }
+
+            Log.i(TAG, "batch start: total=${all.size} pending=${pending.size} skippedByTrack=$skippedByTrack")
             if (pending.isEmpty()) {
                 updateNotification(
-                    if (onlyId > 0) "该视频已不存在（可能被删除或移动）" else "所有视频均已有字幕",
+                    when {
+                        skippedByTrack > 0 -> "有字幕轨，无需生成（跳过 $skippedByTrack 个）"
+                        onlyId > 0 -> "该视频已不存在（可能被删除或移动）"
+                        else -> "所有视频均已有字幕"
+                    },
                     100,
                     false,
                 )
@@ -420,25 +453,29 @@ class SubtitleGenerationService : Service() {
 
             val reasonText = if (failReasons.isEmpty()) "" else
                 "（" + failReasons.entries.joinToString("、") { "${it.key} ${it.value}" } + "）"
+            val trackText = if (skippedByTrack > 0) " / 跳过字幕轨 $skippedByTrack" else ""
             val msg = when {
-                cancelled.get() -> "已取消（成功 $succeeded / 失败 $failed）"
+                cancelled.get() -> "已取消（成功 $succeeded / 失败 $failed$trackText）"
                 onlyId > 0 && succeeded > 0 -> "字幕已生成，进视频即可打开"
                 onlyId > 0 -> "没生成字幕 $reasonText"
-                else -> "完成：成功 $succeeded / 失败 $failed / 共 ${pending.size}$reasonText"
+                else -> "完成：成功 $succeeded / 失败 $failed / 共 ${pending.size}$trackText$reasonText"
             }
             updateNotification(msg, 100, false)
             Log.i(TAG, "batch finished: $msg")
             fileLog("batch finished: $msg")
         } finally {
+            // 先刷状态再关模型：generator.close() 释放 1.2GB native 模型可能耗时数秒，
+            // 系统超时停服务时进程可能在此之前被回收。状态必须先写，否则用户看到的
+            // 永远是超时前一拍的"识别中"，误以为还在跑（实测 11-27 的批量生成就这样）。
+            RUNNING.set(false)
+            publishStatus("批次结束", force = true)
+            releaseWakeLock()
             // 无论正常/取消/异常，都释放大模型。
             // 必须 NonCancellable：服务被 stopSelf/onDestroy 取消时，普通 withContext 会直接
             // 抛 CancellationException 跳过关闭，228MB 模型泄漏；再点一次又加载一份，反复几次吃穿 native 内存。
             withContext(NonCancellable + Dispatchers.Default) {
                 generator?.close()
             }
-            RUNNING.set(false)
-            releaseWakeLock()
-            publishStatus("批次结束", force = true)
             // 关键：结束时把通知从前台服务解绑（DETACH），而不是让它随 stopSelf 一起消失。
             // 否则进度条一闪就没，用户根本不知道到底成没成功；现在它会留在通知栏（可手动滑掉）。
             try {

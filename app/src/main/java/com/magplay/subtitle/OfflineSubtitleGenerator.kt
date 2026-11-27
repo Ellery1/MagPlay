@@ -202,7 +202,7 @@ class OfflineSubtitleGenerator(
             // 整块直通：低信噪比台词 VAD 检不出（15:20 整段 0 段），但 AED 整段直接送能识别。
             // 与 VAD 结果按时间轴合并，重叠处直通优先（诊断证明直通文本更完整）。
             val vadCueCount = cues.size
-            val directCues = directDecode(pcm, baseMs, totalMs, isActive, onProgress)
+            val directCues = directDecode(pcm, baseMs, totalMs, cues, isActive, onProgress)
             val merged = mergeCues(cues, directCues)
             cues.clear()
             cues.addAll(merged)
@@ -229,6 +229,7 @@ class OfflineSubtitleGenerator(
         pcm: FloatArray,
         baseMs: Long,
         totalMs: Long,
+        vadCues: List<SrtCue>,
         isActive: () -> Boolean,
         onProgress: (Progress) -> Unit,
     ): List<SrtCue> {
@@ -237,6 +238,7 @@ class OfflineSubtitleGenerator(
         // pcm 已经被 highPass 原地处理过（见 generate 开头），这里直接用
         var w = 0L
         var winIdx = 0
+        var skipped = 0
         val step = DIRECT_WINDOW_MS - DIRECT_OVERLAP_MS
         while (w < totalMs) {
             if (!isActive()) break
@@ -244,6 +246,21 @@ class OfflineSubtitleGenerator(
             val from = (w * 16).toInt().coerceAtLeast(0)
             val to = (we * 16).toInt().coerceAtMost(pcm.size)
             if (to - from >= 3200) {
+                // 无损提速：窗口内若有 ≥2 个 VAD 段，mergeCues 会无条件丢弃该窗口的
+                // 直通文本（VAD 已细分，直通整段文本无法可靠对应）。既然结果必被丢弃，
+                // 提前跳过 AED 推理，字幕输出逐字不变。判定口径与 mergeCues 完全一致：
+                // 用同一份 vad cues、同一个 800ms 重叠阈值。
+                val absW = baseMs + w
+                val absWe = baseMs + we
+                val covering = vadCues.count { v ->
+                    minOf(absWe, v.endMs) - maxOf(absW, v.startMs) >= MERGE_MIN_OVERLAP_MS
+                }
+                if (covering >= 2) {
+                    skipped++
+                    winIdx++
+                    w += step
+                    continue
+                }
                 val seg = pcm.copyOfRange(from, to)
                 val samples = AudioPreprocess.normalize(seg, maxGain = DIRECT_MAX_GAIN)
                 val stream = rec.createStream()
@@ -279,6 +296,7 @@ class OfflineSubtitleGenerator(
             val pct = (w * 100 / totalMs.coerceAtLeast(1)).toInt().coerceIn(0, 100)
             onProgress(Progress("直通补漏 $pct%", pct))
         }
+        if (skipped > 0) onDiagnostic("R5 direct-skip chunk@$baseMs skipped=$skipped (mergeCues 必丢弃)")
         return out
     }
 

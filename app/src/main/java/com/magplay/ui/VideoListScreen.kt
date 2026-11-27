@@ -34,8 +34,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -86,6 +86,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
@@ -138,6 +139,8 @@ fun VideoListScreen(
     val scope = rememberCoroutineScope()
     var query by remember { mutableStateOf("") }
     var currentDir by remember { mutableStateOf("") }
+    // R3：每个目录记住自己的滚动位置。切走再回来时回到离开时的位置，而不是顶部。
+    val dirScrollStates = remember { mutableMapOf<String, LazyListState>() }
     var sortKey by remember { mutableStateOf(SortKey.DATE) }
     var ascending by remember { mutableStateOf(false) }
     var sortExpanded by remember { mutableStateOf(false) }
@@ -575,6 +578,11 @@ fun VideoListScreen(
                     // 这就是用户说的"长按经常直接进播放"。
                     var longPressed = false
                     var swiped = false
+                    var released = false
+                    var movedMuch = false
+                    var releaseChange: PointerInputChange? = null
+                    val tapTimeoutMs = 300L      // 短按上限：超过它再松手视为"长按意图"，弹菜单而不是播放
+                    val movedSlop = slop * 2f     // 容忍手指自然微抖
                     while (true) {
                         val remain = downAt + timeoutMs - SystemClock.uptimeMillis()
                         if (remain <= 0) {
@@ -587,9 +595,14 @@ fun VideoListScreen(
                             break
                         }
                         val change = event.changes.firstOrNull { it.id == down.id } ?: break
-                        if (!change.pressed) break
+                        if (!change.pressed) {
+                            released = true
+                            releaseChange = change
+                            break
+                        }
                         val dx = change.position.x - down.position.x
                         val dy = change.position.y - down.position.y
+                        if ((change.position - down.position).getDistance() > movedSlop) movedMuch = true
                         if (dx > menuSwipePx && dx > kotlin.math.abs(dy) * 1.5f) {
                             change.consume()
                             swiped = true
@@ -613,7 +626,28 @@ fun VideoListScreen(
                         else if (hitDirName != null) dirActionTarget = fullDirPath(currentDir, hitDirName)
                         return@awaitEachGesture
                     }
-                    if (!longPressed) return@awaitEachGesture
+
+                    // 抬手（未到右滑/长按超时）：点击全部在这一层裁决，列表项已无 clickable，
+                    // 所以只有这里主动调 onSelect 才会播放——从根上杜绝"长按松手误播放"。
+                    if (released) {
+                        val heldMs = SystemClock.uptimeMillis() - downAt
+                        releaseChange?.consume()
+                        if (!movedMuch && heldMs < tapTimeoutMs) {
+                            // 短按：视频播放 / 文件夹进入
+                            if (hitVideo != null) onSelect(hitVideo)
+                            else if (hitDirName != null) {
+                                currentDir = if (currentDir.isEmpty()) hitDirName else "$currentDir/$hitDirName"
+                                query = ""
+                            }
+                        } else if (!movedMuch) {
+                            // 按住一会儿才松手（没等到 500ms 长按判定）：按长按意图弹菜单
+                            haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                            if (hitVideo != null) actionTarget = hitVideo
+                            else if (hitDirName != null) dirActionTarget = fullDirPath(currentDir, hitDirName)
+                        }
+                        return@awaitEachGesture
+                    }
+                    if (!longPressed) return@awaitEachGesture   // 滚动/返回：让给下层
 
                     haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                     if (hitVideo == null && hitDirName != null) {
@@ -788,7 +822,8 @@ fun VideoListScreen(
                     .fillMaxSize()
                     .onGloballyPositioned { listTopInWindow = it.boundsInWindow().top },
             ) {
-            val listState = rememberLazyListState()
+            // 每个目录一个 LazyListState，离开时 Compose 保留它、回来时直接复用其滚动位置。
+            val listState = dirScrollStates.getOrPut(currentDir) { LazyListState() }
             val itemCount = childDirs.size + sorted.size
             LazyColumn(
                 state = listState,
@@ -806,10 +841,6 @@ fun VideoListScreen(
                             highlighted = dragMoved && hoverDir == dir,
                             onBounds = { rect -> dirRects[dir] = rect },
                             onGone = { dirRects.remove(dir) },
-                            onClick = {
-                                currentDir = if (currentDir.isEmpty()) dir else "$currentDir/$dir"
-                                query = ""
-                            },
                         )
                     }
                 }
@@ -818,7 +849,6 @@ fun VideoListScreen(
                     // 手势放在项里会被连带取消，拖到顶部回上一级就断了。
                     VideoCard(
                         video = video,
-                        onClick = { onSelect(video) },
                         onBounds = { rect -> videoRects[video.id] = rect },
                         onGone = { videoRects.remove(video.id) },
                     )
@@ -1305,7 +1335,6 @@ private fun DirCard(
     highlighted: Boolean = false,
     onBounds: (Rect) -> Unit = {},
     onGone: () -> Unit = {},
-    onClick: () -> Unit,
 ) {
     // 列表滚出屏幕后旧坐标必须失效，否则拖拽会命中已经不在屏幕上的文件夹
     androidx.compose.runtime.DisposableEffect(name) {
@@ -1319,8 +1348,7 @@ private fun DirCard(
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 4.dp)
-            .onGloballyPositioned { onBounds(it.boundsInWindow()) }
-            .clickable(onClick = onClick),
+            .onGloballyPositioned { onBounds(it.boundsInWindow()) },
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(12.dp)) {
             Box(
@@ -1348,7 +1376,6 @@ private fun DirCard(
 @Composable
 private fun VideoCard(
     video: VideoItem,
-    onClick: () -> Unit,
     onBounds: (Rect) -> Unit = {},
     onGone: () -> Unit = {},
 ) {
@@ -1369,8 +1396,7 @@ private fun VideoCard(
         modifier = Modifier
             .fillMaxWidth()
             .onGloballyPositioned { onBounds(it.boundsInWindow()) }
-            .padding(vertical = 4.dp)
-            .clickable(onClick = onClick),
+            .padding(vertical = 4.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(12.dp)) {
             Box(

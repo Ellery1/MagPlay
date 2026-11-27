@@ -61,10 +61,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
+import androidx.media3.common.Tracks
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.magplay.data.AppLog
@@ -89,6 +91,16 @@ private const val HINT_SPEED = 11
 private const val HINT_BRIGHTNESS = 12
 private const val HINT_VOLUME = 13
 private const val HINT_INFO = 14
+
+/** 轨道类型可读名，用于播放页轨道诊断日志。 */
+private fun trackTypeName(t: Int): String = when (t) {
+    C.TRACK_TYPE_VIDEO -> "VIDEO"
+    C.TRACK_TYPE_AUDIO -> "AUDIO"
+    C.TRACK_TYPE_TEXT -> "TEXT"
+    C.TRACK_TYPE_IMAGE -> "IMAGE"
+    C.TRACK_TYPE_METADATA -> "METADATA"
+    else -> "TYPE_$t"
+}
 
 /**
  * 手势提示。
@@ -161,6 +173,28 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
 
     DisposableEffect(player) {
         val listener = object : Player.Listener {
+            // 轨道诊断：容器里到底有没有封装字幕轨，直接读 ExoPlayer 解析结果，一锤定音。
+            // 输出进 AppLog，用户在「运行日志」页导出即可，不用连电脑。
+            override fun onTracksChanged(tracks: Tracks) {
+                val sb = StringBuilder()
+                var groupIdx = 0
+                for (group in tracks.groups) {
+                    for (i in 0 until group.length) {
+                        val fmt = group.getTrackFormat(i)
+                        val mime = fmt.sampleMimeType ?: fmt.containerMimeType ?: "?"
+                        sb.append(
+                            "[g$groupIdx ${trackTypeName(group.type)} mime=$mime " +
+                                "lang=${fmt.language ?: "?"} sel=${group.isTrackSelected(i)} " +
+                                "sup=${group.isTrackSupported(i)}] ",
+                        )
+                    }
+                    groupIdx++
+                }
+                if (sb.isNotEmpty()) {
+                    AppLog.i("Player", "轨道诊断 ${item.name}: $sb")
+                }
+            }
+
             override fun onPlayerError(error: PlaybackException) {
                 // 播放失败记进 App 内日志：用户导出后即可定位，无需 adb
                 AppLog.e(
