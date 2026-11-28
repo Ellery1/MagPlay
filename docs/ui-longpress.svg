@@ -1,0 +1,38 @@
+<svg width="100%" viewBox="0 0 680 384" xmlns="http://www.w3.org/2000/svg" role="img" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<title>长按视频：现在的行为与改后的行为对比</title>
+<desc>左列显示现在必须松手才弹出菜单，右列显示改后按住 500 毫秒菜单立刻弹出。</desc>
+
+<text x="40" y="28" font-size="15" font-weight="500" fill="#2C2C2A">长按视频：现在 vs 改后</text>
+
+<text x="40" y="62" font-size="13" font-weight="500" fill="#A32D2D">现在：必须松手才弹菜单</text>
+<text x="352" y="62" font-size="13" font-weight="500" fill="#3B6D11">改后：到点立刻弹菜单</text>
+
+<rect x="40" y="78" width="278" height="44" rx="10" fill="#FCEBEB" stroke="#E24B4A" stroke-width="0.5"/>
+<text x="56" y="100" font-size="13" fill="#501313" dominant-baseline="central">1  手指按住视频</text>
+
+<rect x="40" y="138" width="278" height="44" rx="10" fill="#FCEBEB" stroke="#E24B4A" stroke-width="0.5"/>
+<text x="56" y="160" font-size="13" fill="#501313" dominant-baseline="central">2  500ms 到点：只震动一下</text>
+
+<rect x="40" y="198" width="278" height="44" rx="10" fill="#FCEBEB" stroke="#E24B4A" stroke-width="0.5"/>
+<text x="56" y="220" font-size="13" fill="#501313" dominant-baseline="central">3  继续按住：屏幕毫无变化</text>
+
+<rect x="40" y="258" width="278" height="52" rx="10" fill="#F7C1C1" stroke="#E24B4A" stroke-width="0.5"/>
+<text x="56" y="276" font-size="13" fill="#501313" dominant-baseline="central">4  松手：菜单这才出现</text>
+<text x="56" y="294" font-size="12" fill="#A32D2D" dominant-baseline="central">用户早就以为长按失效了</text>
+
+<rect x="352" y="78" width="278" height="44" rx="10" fill="#EAF3DE" stroke="#639922" stroke-width="0.5"/>
+<text x="368" y="100" font-size="13" fill="#173404" dominant-baseline="central">1  手指按住视频</text>
+
+<rect x="352" y="138" width="278" height="52" rx="10" fill="#C0DD97" stroke="#639922" stroke-width="0.5"/>
+<text x="368" y="156" font-size="13" fill="#173404" dominant-baseline="central">2  500ms 到点：震动 + 菜单弹出</text>
+<text x="368" y="174" font-size="12" fill="#3B6D11" dominant-baseline="central">手指还没松，菜单已经在了</text>
+
+<rect x="352" y="198" width="278" height="44" rx="10" fill="#EAF3DE" stroke="#639922" stroke-width="0.5"/>
+<text x="368" y="220" font-size="13" fill="#173404" dominant-baseline="central">3  松手：菜单还在，直接点</text>
+
+<rect x="352" y="258" width="278" height="52" rx="10" fill="#EAF3DE" stroke="#639922" stroke-width="0.5"/>
+<text x="368" y="276" font-size="13" fill="#173404" dominant-baseline="central">4  按住继续拖：菜单收起</text>
+<text x="368" y="294" font-size="12" fill="#3B6D11" dominant-baseline="central">转为移动视频，原能力保留</text>
+
+<text x="40" y="340" font-size="12" fill="#5F5E5A">改后不再有"按住半天没反应"的窗口期：到点就有可见反馈，松不松手都不影响菜单出现。</text>
+</svg>

@@ -1,0 +1,44 @@
+<svg width="100%" viewBox="0 0 680 512" xmlns="http://www.w3.org/2000/svg" role="img" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<title>长按菜单：现在的样式与改后的样式</title>
+<desc>左侧是居中弹出的对话框式菜单，底部只有一个取消按钮；右侧是从底部滑出的操作面板。</desc>
+
+<text x="40" y="28" font-size="15" font-weight="500" fill="#2C2C2A">长按菜单：现在的样子 vs 改后的样子</text>
+
+<rect x="40" y="56" width="280" height="396" rx="20" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
+<rect x="360" y="56" width="280" height="396" rx="20" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
+
+<rect x="60" y="86" width="240" height="40" rx="8" fill="#D3D1C7"/>
+<rect x="60" y="134" width="240" height="40" rx="8" fill="#D3D1C7"/>
+<rect x="60" y="182" width="240" height="40" rx="8" fill="#D3D1C7"/>
+
+<rect x="380" y="86" width="240" height="40" rx="8" fill="#D3D1C7"/>
+<rect x="380" y="134" width="240" height="40" rx="8" fill="#D3D1C7"/>
+<rect x="380" y="182" width="240" height="40" rx="8" fill="#D3D1C7"/>
+
+<rect x="78" y="196" width="204" height="176" rx="18" fill="#FFFFFF" stroke="#888780" stroke-width="0.5"/>
+<text x="96" y="222" font-size="12" font-weight="500" fill="#2C2C2A">视频名称.mp4</text>
+<line x1="78" y1="238" x2="282" y2="238" stroke="#D3D1C7" stroke-width="0.5"/>
+<text x="96" y="262" font-size="12" fill="#444441">为这个视频生成字幕</text>
+<text x="96" y="292" font-size="12" fill="#444441">重命名</text>
+<text x="96" y="322" font-size="12" fill="#A32D2D">删除</text>
+<line x1="78" y1="340" x2="282" y2="340" stroke="#D3D1C7" stroke-width="0.5"/>
+<rect x="212" y="344" width="60" height="24" rx="6" fill="#F1EFE8"/>
+<text x="242" y="360" font-size="11" fill="#5F5E5A" text-anchor="middle" dominant-baseline="central">取消</text>
+
+<text x="40" y="478" font-size="12" fill="#5F5E5A">居中弹出，和手指刚才按的位置无关</text>
+<text x="40" y="496" font-size="12" fill="#5F5E5A">右边孤零零一个"取消"，确认键是空的</text>
+
+<rect x="360" y="268" width="280" height="184" rx="18" fill="#FFFFFF" stroke="#888780" stroke-width="0.5"/>
+<rect x="468" y="280" width="64" height="4" rx="2" fill="#D3D1C7"/>
+<text x="380" y="306" font-size="12" font-weight="500" fill="#2C2C2A">视频名称.mp4</text>
+<text x="380" y="326" font-size="11" fill="#888780">选择要执行的操作</text>
+<line x1="376" y1="338" x2="624" y2="338" stroke="#E5E3DC" stroke-width="0.5"/>
+<text x="380" y="360" font-size="12" fill="#444441">为这个视频生成字幕</text>
+<line x1="376" y1="376" x2="624" y2="376" stroke="#E5E3DC" stroke-width="0.5"/>
+<text x="380" y="396" font-size="12" fill="#444441">重命名</text>
+<line x1="376" y1="412" x2="624" y2="412" stroke="#E5E3DC" stroke-width="0.5"/>
+<text x="380" y="432" font-size="12" fill="#A32D2D">删除</text>
+
+<text x="360" y="478" font-size="12" fill="#5F5E5A">从底部滑出，拇指够得到</text>
+<text x="360" y="496" font-size="12" fill="#5F5E5A">没有多余按钮，点空白或下滑即关闭</text>
+</svg>

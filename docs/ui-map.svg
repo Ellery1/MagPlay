@@ -1,0 +1,50 @@
+<svg width="100%" viewBox="0 0 680 466" xmlns="http://www.w3.org/2000/svg" role="img" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<title>按使用场景划分的体验问题与改进效果</title>
+<desc>五个场景：打开应用、播放失败、播放控件、日志页返回、字幕进度提示，分别列出当前问题和改后效果。</desc>
+
+<text x="40" y="28" font-size="15" font-weight="500" fill="#2C2C2A">按场景看：现在是什么样，改后会是什么样</text>
+
+<text x="44" y="58" font-size="12" font-weight="500" fill="#5F5E5A">场景</text>
+<text x="196" y="58" font-size="12" font-weight="500" fill="#A32D2D">现在的问题</text>
+<text x="448" y="58" font-size="12" font-weight="500" fill="#3B6D11">改后效果</text>
+<line x1="40" y1="68" x2="640" y2="68" stroke="#D3D1C7" stroke-width="0.5"/>
+
+<rect x="40" y="74" width="600" height="70" rx="0" fill="#FAFAF8"/>
+<text x="44" y="100" font-size="13" font-weight="500" fill="#2C2C2A">打开应用</text>
+<text x="196" y="98" font-size="12" fill="#A32D2D">没视频 / 扫描中 / 没权限</text>
+<text x="196" y="116" font-size="12" fill="#A32D2D">看到的都是一片空白</text>
+<text x="448" y="98" font-size="12" fill="#3B6D11">分别显示对应提示</text>
+<text x="448" y="116" font-size="12" fill="#3B6D11">权限问题给"去授权"按钮</text>
+<line x1="40" y1="144" x2="640" y2="144" stroke="#E5E3DC" stroke-width="0.5"/>
+
+<text x="44" y="170" font-size="13" font-weight="500" fill="#2C2C2A">播放失败</text>
+<text x="196" y="168" font-size="12" fill="#A32D2D">画面全黑，控制条还在</text>
+<text x="196" y="186" font-size="12" fill="#A32D2D">按了没反应，不知道错在哪</text>
+<text x="448" y="168" font-size="12" fill="#3B6D11">说明失败原因</text>
+<text x="448" y="186" font-size="12" fill="#3B6D11">给"重试"和"返回列表"</text>
+<line x1="40" y1="214" x2="640" y2="214" stroke="#E5E3DC" stroke-width="0.5"/>
+
+<rect x="40" y="220" width="600" height="70" rx="0" fill="#FAFAF8"/>
+<text x="44" y="246" font-size="13" font-weight="500" fill="#2C2C2A">播放控件</text>
+<text x="196" y="244" font-size="12" fill="#A32D2D">点画面，按钮出现但进度条不出</text>
+<text x="196" y="262" font-size="12" fill="#A32D2D">3 秒后按钮消失，进度条反而留着</text>
+<text x="448" y="244" font-size="12" fill="#3B6D11">所有控件同步出现</text>
+<text x="448" y="262" font-size="12" fill="#3B6D11">同步隐藏，不再各走各的</text>
+<line x1="40" y1="290" x2="640" y2="290" stroke="#E5E3DC" stroke-width="0.5"/>
+
+<text x="44" y="316" font-size="13" font-weight="500" fill="#2C2C2A">日志页</text>
+<text x="196" y="314" font-size="12" fill="#A32D2D">按系统返回键直接退出 App</text>
+<text x="196" y="332" font-size="12" fill="#A32D2D">其他页面都是返回上一级</text>
+<text x="448" y="314" font-size="12" fill="#3B6D11">返回上一级</text>
+<text x="448" y="332" font-size="12" fill="#3B6D11">和播放器、列表页行为一致</text>
+<line x1="40" y1="360" x2="640" y2="360" stroke="#E5E3DC" stroke-width="0.5"/>
+
+<rect x="40" y="366" width="600" height="70" rx="0" fill="#FAFAF8"/>
+<text x="44" y="392" font-size="13" font-weight="500" fill="#2C2C2A">字幕进度</text>
+<text x="196" y="390" font-size="12" fill="#A32D2D">通知权限没开</text>
+<text x="196" y="408" font-size="12" fill="#A32D2D">照样提示"进度见通知栏"</text>
+<text x="448" y="390" font-size="12" fill="#3B6D11">按权限状态换提示</text>
+<text x="448" y="408" font-size="12" fill="#3B6D11">提供"去开启通知"入口</text>
+
+<text x="40" y="452" font-size="12" fill="#888780">这五条是功能性缺陷，不是审美问题。其余配色、字号、平板适配等归为第二批。</text>
+</svg>
