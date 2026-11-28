@@ -36,6 +36,9 @@ object ModelDownloader {
             val fileIndex: Int,
             val fileCount: Int,
             val percent: Int,
+            /** 整包已下载字节数 / 整包总字节数（含已完成的文件），用于显示"320.5 / 1200 MB" */
+            val doneBytes: Long = 0L,
+            val totalBytes: Long = 0L,
         ) : State
         data class Installed(val version: Int) : State
         data class Failed(val message: String) : State
@@ -66,13 +69,17 @@ object ModelDownloader {
         try {
             val manifest = fetchManifest()
             val dir = AsrModels.dirOf(context, AsrBackend.FIRERED_AED).apply { mkdirs() }
+            val totalBytes = manifest.files.sumOf { it.size }
+            var baseDone = 0L
             manifest.files.forEachIndexed { index, f ->
                 if (cancelled) throw InterruptedException("已取消")
                 val dest = File(dir, f.name)
                 if (dest.isFile && dest.length() == f.size && sha256(dest) == f.sha256) {
+                    baseDone += f.size
                     return@forEachIndexed
                 }
-                downloadOne(f, dest, index, manifest.files.size)
+                downloadOne(f, dest, index, manifest.files.size, baseDone, totalBytes)
+                baseDone += f.size
             }
             _state.value = State.Installed(manifest.version)
             AppLog.i("ModelDl", "模型安装完成 v${manifest.version}")
@@ -103,7 +110,14 @@ object ModelDownloader {
         return Manifest(version, files)
     }
 
-    private fun downloadOne(f: ManifestFile, dest: File, index: Int, total: Int) {
+    private fun downloadOne(
+        f: ManifestFile,
+        dest: File,
+        index: Int,
+        total: Int,
+        baseDone: Long,
+        totalBytes: Long,
+    ) {
         val part = File(dest.parentFile, "${dest.name}.part")
         var urlConnection: HttpURLConnection? = null
         try {
@@ -131,7 +145,14 @@ object ModelDownloader {
                         val pct = (done * 100f / f.size).roundToInt().coerceAtMost(100)
                         if (pct != lastPct) {
                             lastPct = pct
-                            _state.value = State.Downloading(f.name, index + 1, total, pct)
+                            _state.value = State.Downloading(
+                                fileName = f.name,
+                                fileIndex = index + 1,
+                                fileCount = total,
+                                percent = pct,
+                                doneBytes = baseDone + done,
+                                totalBytes = totalBytes,
+                            )
                         }
                     }
                 }

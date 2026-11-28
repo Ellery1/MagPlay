@@ -67,6 +67,8 @@ import java.util.Locale
  */
 @Composable
 fun LogScreen(onBack: () -> Unit) {
+    // 系统返回键要回上一级，不能直接退出 App——其他页面都是这个行为，只有这里退出极易误触
+    androidx.activity.compose.BackHandler(onBack = onBack)
     val context = LocalContext.current
     var seq by remember { mutableIntStateOf(0) }
     var text by remember { mutableStateOf("") }
@@ -97,7 +99,7 @@ fun LogScreen(onBack: () -> Unit) {
             Column(modifier = Modifier.weight(1f)) {
                 Text("运行日志", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
                 Text(
-                    "导出后可直接用微信发出去，无需连接电脑",
+                    "共 ${text.count { it == '\n' } + 1} 行 · 导出后可直接用微信发出去",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -111,24 +113,6 @@ fun LogScreen(onBack: () -> Unit) {
             IconButton(onClick = { confirmClear = true }) {
                 Icon(Icons.Filled.DeleteOutline, contentDescription = "清空日志")
             }
-        }
-
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 4.dp),
-        ) {
-            AssistChip(onClick = { shareLog(context) }, label = { Text("导出并分享") })
-            AssistChip(onClick = { seq++ }, label = { Text("刷新") })
-            Spacer(Modifier.width(2.dp))
-            Text(
-                "共 ${text.count { it == '\n' } + 1} 行",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
         }
 
         SelfCheckCard(context)
@@ -182,6 +166,9 @@ private fun SelfCheckCard(context: android.content.Context) {
     }
     val snap = remember(tick) { GenStatus.read(context) }
     val exempt = remember(tick) { PowerGuard.isIgnoringBatteryOptimizations(context) }
+    // status.json 会在进程被强杀时残留 running=true（最多 2 分钟才按心跳判死）。
+    // 运行锁是内核级的，进程一死就释放，用它做最终裁决，结论立即准确。
+    val locked = remember(tick) { GenStatus.isRunLocked(context) }
 
     val dark = isSystemInDarkTheme()
     val okColor = if (dark) Color(0xFF5EE0B8) else Color(0xFF0CA678)
@@ -190,24 +177,43 @@ private fun SelfCheckCard(context: android.content.Context) {
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
 
     val ageSec = (snap?.ageMs ?: Long.MAX_VALUE).coerceAtLeast(0L) / 1000L
-    val (svcText, svcColor) = when {
-        snap == null -> "无记录（尚未生成过）" to muted
-        snap.running && ageSec < 120 -> "运行中" to okColor
-        snap.running -> "疑似被冻结：${ageSec}s 无心跳" to badColor
-        else -> "空闲" to muted
+    val running = snap?.running == true && locked
+    val stale = running && ageSec >= 180
+
+    // 一句话结论：普通用户只想知道"锁屏后还能不能继续跑"，
+    // 不需要看懂"前台服务 / 唤醒锁 / 心跳"这些词。
+    val (headline, headColor) = when {
+        stale -> "生成好像卡住了：${formatAge(ageSec)}没有响应" to badColor
+        running && !exempt -> "正在生成，但锁屏后可能被系统停掉" to warnColor
+        running && ageSec < 90 -> "正在生成，锁屏后可以继续" to okColor
+        running -> "正在生成，最近响应偏慢" to warnColor
+        snap == null -> "还没有生成过字幕" to muted
+        snap.running -> "上次生成已中断（App 被关闭或覆盖安装）" to warnColor
+        else -> "当前没有生成任务" to muted
     }
-    val (lockText, lockColor) = when {
-        snap == null -> "—" to muted
-        snap.wakeLock -> "已持有（锁屏可续跑）" to okColor
-        snap.running -> "未持有（锁屏会停）" to badColor
-        else -> "未持有" to muted
+
+    var showDetail by remember { mutableStateOf(false) }
+
+    val (svcText, svcColor) = when {
+        snap == null -> "无记录" to muted
+        running && ageSec < 120 -> "运行中" to okColor
+        running -> "疑似被冻结：${ageSec}s 无心跳" to badColor
+        snap.running -> "已中断（进程已退出）" to warnColor
+        else -> "空闲" to muted
     }
     val (beatText, beatColor) = when {
         snap == null -> "—" to muted
-        !snap.running -> "已结束 ${formatAge(ageSec)}" to muted
+        !running -> "已结束 ${formatAge(ageSec)}" to muted
         ageSec < 90 -> "${ageSec}s 前（正常）" to okColor
         ageSec < 180 -> "${ageSec}s 前（偏慢）" to warnColor
         else -> "${ageSec}s 前（停滞）" to badColor
+    }
+    val (lockText, lockColor) = when {
+        snap == null -> "—" to muted
+        snap.wakeLock && running -> "已持有（锁屏可续跑）" to okColor
+        running -> "未持有（锁屏会停）" to badColor
+        snap.wakeLock -> "已释放" to muted
+        else -> "未持有" to muted
     }
 
     Surface(
@@ -222,18 +228,18 @@ private fun SelfCheckCard(context: android.content.Context) {
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    "后台自检",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold,
+                Box(
+                    modifier = Modifier
+                        .size(7.dp)
+                        .background(headColor, CircleShape),
                 )
                 Spacer(Modifier.width(8.dp))
                 Text(
-                    text = if (exempt && snap?.wakeLock == true) "可锁屏续跑" else "有风险",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = if (exempt && snap?.wakeLock == true) okColor else warnColor,
+                    headline,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = headColor,
+                    modifier = Modifier.weight(1f),
                 )
-                Spacer(Modifier.weight(1f))
                 if (!exempt) {
                     TextButton(
                         onClick = { PowerGuard.requestIgnoreBatteryOptimizations(context) },
@@ -246,14 +252,6 @@ private fun SelfCheckCard(context: android.content.Context) {
                     }
                 }
             }
-            StatusRow(
-                label = "电池优化",
-                value = if (exempt) "已豁免" else "未豁免（锁屏可能被限制）",
-                color = if (exempt) okColor else badColor,
-            )
-            StatusRow(label = "前台服务", value = svcText, color = svcColor)
-            StatusRow(label = "唤醒锁", value = lockText, color = lockColor)
-            StatusRow(label = "最近心跳", value = beatText, color = beatColor)
             if (!snap?.text.isNullOrBlank()) {
                 Text(
                     text = "当前：${snap?.text}",
@@ -263,13 +261,32 @@ private fun SelfCheckCard(context: android.content.Context) {
                     overflow = TextOverflow.Ellipsis,
                 )
             }
-            if (isXiaomiLike()) {
+            TextButton(
+                onClick = { showDetail = !showDetail },
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
+            ) {
                 Text(
-                    text = "小米/华为还需：设置 → 应用管理 → MagPlay → 省电策略=无限制 + 自启动。" +
-                        "覆盖安装会保留，卸载重装需重做。",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = muted,
+                    if (showDetail) "收起详情" else "查看详情",
+                    style = MaterialTheme.typography.labelMedium,
                 )
+            }
+            if (showDetail) {
+                StatusRow(
+                    label = "电池优化",
+                    value = if (exempt) "已豁免" else "未豁免（锁屏可能被限制）",
+                    color = if (exempt) okColor else badColor,
+                )
+                StatusRow(label = "前台服务", value = svcText, color = svcColor)
+                StatusRow(label = "唤醒锁", value = lockText, color = lockColor)
+                StatusRow(label = "最近心跳", value = beatText, color = beatColor)
+                if (isXiaomiLike()) {
+                    Text(
+                        text = "小米/华为还需：设置 → 应用管理 → MagPlay → 省电策略=无限制 + 自启动。" +
+                            "覆盖安装会保留，卸载重装需重做。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = muted,
+                    )
+                }
             }
         }
     }

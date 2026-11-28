@@ -40,9 +40,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ScreenRotation
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -59,7 +63,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -70,6 +76,7 @@ import androidx.media3.common.Tracks
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.magplay.data.AppLog
+import com.magplay.data.AppPrefs
 import com.magplay.data.PlaybackProgress
 import com.magplay.data.VideoItem
 import com.magplay.subtitle.SrtCue
@@ -91,6 +98,8 @@ private const val HINT_SPEED = 11
 private const val HINT_BRIGHTNESS = 12
 private const val HINT_VOLUME = 13
 private const val HINT_INFO = 14
+/** 横滑拖进度：提示放右侧，不挡画面正中 */
+private const val HINT_SEEK = 15
 
 /** 轨道类型可读名，用于播放页轨道诊断日志。 */
 private fun trackTypeName(t: Int): String = when (t) {
@@ -130,6 +139,10 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
     } else 0
     val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
 
+    /** 音量档位换算成百分比："12/15" 这种数字用户看不懂，和亮度的百分比也对不上。 */
+    fun volumePercent(v: Int): Int =
+        ((v - minVolume).toFloat() / (maxVolume - minVolume).coerceAtLeast(1) * 100).roundToInt()
+
     // 横屏播放；亮度是本 Activity 私有的，退出时恢复进入前的值。
     // R10：播放页活跃期间（含暂停）全程保屏，退出即释放，与旋转/亮度恢复同一 Effect。
     DisposableEffect(Unit) {
@@ -153,7 +166,13 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
 
     // ---- 字幕状态：唯一来源是同目录同名 .srt ----
     var subtitleText by remember { mutableStateOf("") }
-    var subtitleOn by remember { mutableStateOf(false) }
+    // 记住用户上次的开关：上次关掉了，这次进来就别自作主张打开
+    var subtitleOn by remember { mutableStateOf(AppPrefs.subtitleOn) }
+
+    // 播放状态：错误要说清"为什么黑屏"，缓冲要给个转圈，别让人对着黑屏猜
+    var playError by remember { mutableStateOf<PlaybackException?>(null) }
+    var buffering by remember { mutableStateOf(true) }
+    var readyOnce by remember { mutableStateOf(false) }
 
     // 进入播放页时查同目录同名 .srt；只有校验通过才用
     var offlineCues by remember { mutableStateOf<List<SrtCue>>(emptyList()) }
@@ -202,10 +221,15 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
                     "播放失败 ${item.name}（errorCode=${error.errorCodeName}）: ${error.message}",
                     error,
                 )
+                playError = error
+                buffering = false
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
+                buffering = playbackState == Player.STATE_BUFFERING
                 if (playbackState == Player.STATE_READY) {
+                    readyOnce = true
+                    playError = null
                     AppLog.i("Player", "就绪 ${item.name}，时长 ${player.duration}ms")
                     if (!resumeDone) {
                         resumeDone = true
@@ -256,6 +280,17 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
     fun revealControls() {
         controlsVisible = true
         controlsSeq++
+    }
+
+    // ref 供点击画面切换控件使用
+    var playerViewRef by remember { mutableStateOf<PlayerView?>(null) }
+
+    // 控件显隐只认 controlsVisible 一个来源：Compose 那层（返回/字幕/倍率/旋转）和 media3
+    // 自带控制条（时间、进度）必须同进同出。旧逻辑只切 Compose 那层，media3 自己按
+    // controllerShowTimeoutMs 走，于是出现"按钮消失了，进度条还留在屏幕上"。
+    LaunchedEffect(controlsVisible, playerViewRef) {
+        val v = playerViewRef ?: return@LaunchedEffect
+        if (controlsVisible) v.showController() else v.hideController()
     }
 
     // R7：控制条显隐时同步显隐系统状态栏（时间 / 通知 / 电量）。
@@ -320,6 +355,7 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
         }
         subtitleOn = !subtitleOn
         subtitleText = ""
+        AppPrefs.updateSubtitleOn(subtitleOn)
         showHint(HINT_INFO, if (subtitleOn) "字幕 开" else "字幕 关", 0f)
         AppLog.i("Subtitle", if (subtitleOn) "开启字幕：${item.name}" else "关闭字幕：${item.name}")
     }
@@ -336,7 +372,8 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
             val clean = SrtFile.sanitize(raw, item.durationMs)
             offlineCues = clean
             offlineBad = false
-            subtitleOn = true
+            // 沿用上次的选择：用户上次关掉字幕，这次进来自动打开就是在跟他作对
+            subtitleOn = AppPrefs.subtitleOn
             Log.i("MagPlayPlayer", "offline subtitle matched: ${clean.size} cues for ${item.name}")
             AppLog.i("Subtitle", "离线字幕命中：${clean.size} 条，${item.name}")
         } else {
@@ -408,9 +445,6 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
         }
     }
 
-    // ref 供点击画面切换控件使用
-    var playerViewRef by remember { mutableStateOf<PlayerView?>(null) }
-
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
         AndroidView(
             factory = { ctx ->
@@ -426,6 +460,10 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
                 var pendingVolume = 0
                 var seekBaseX = 0f
                 var seekBasePosition = 0L
+                // 拖动时只更新"预览目标"，松手才真正 seek：
+                // 原来每个 MOVE 都 seekTo，高刷屏上一卡一卡的，而且解码器被反复打断
+                var seekPreviewTarget = 0L
+                var seekPreviewDuration = 0L
 
                 // 双击判定：上一次抬手的时间/坐标 + 待执行的单击动作
                 var lastTapMs = 0L
@@ -470,7 +508,7 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
                         baseVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
                         pendingVolume = baseVolume
                         showHint(
-                            HINT_VOLUME, "音量 $pendingVolume/$maxVolume",
+                            HINT_VOLUME, "音量 ${volumePercent(pendingVolume)}%",
                             (pendingVolume - minVolume).toFloat() / (maxVolume - minVolume).coerceAtLeast(1),
                         )
                     }
@@ -480,6 +518,8 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
                     this.player = player
                     useController = true
                     controllerAutoShow = false
+                    // 0 = 不让 media3 自己计时隐藏，显隐统一由 controlsVisible 驱动
+                    controllerShowTimeoutMs = 0
                     setShowFastForwardButton(false)
                     setShowRewindButton(false)
                     setShowPreviousButton(false)
@@ -546,6 +586,12 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
                                             mode = MODE_SEEK
                                             seekBaseX = event.x
                                             seekBasePosition = player.currentPosition
+                                            seekPreviewTarget = seekBasePosition
+                                            seekPreviewDuration = if (player.duration > 0) {
+                                                player.duration
+                                            } else {
+                                                item.durationMs.coerceAtLeast(0L)
+                                            }
                                             Log.i(
                                                 "MagPlaySeek",
                                                 "enter seek: dx=$dx dy=$dy baseX=$seekBaseX base=${seekBasePosition}",
@@ -581,14 +627,18 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
                                                 "baseX=$seekBaseX x=${event.x} base=${seekBasePosition} " +
                                                 "delta=${deltaMs.toLong()} target=$target",
                                         )
-                                        player.seekTo(target)
+                                        // 只预览，不真的跳：拖一次会连续触发几十个 seekTo，
+                                        // 解码器被反复打断，高刷屏上看起来就是"一顿一顿"
+                                        seekPreviewTarget = target
+                                        seekPreviewDuration = durationMs
                                         val sec = target / 1000L
                                         showHint(
-                                            HINT_INFO,
+                                            HINT_SEEK,
                                             "%02d:%02d / %02d:%02d".format(
-                                                sec / 60, sec % 60, durationMs / 1000 / 60, durationMs / 1000 % 60,
+                                                sec / 60, sec % 60,
+                                                durationMs / 1000 / 60, durationMs / 1000 % 60,
                                             ),
-                                            0f,
+                                            if (durationMs > 0) target.toFloat() / durationMs else 0f,
                                         )
                                     }
                                     MODE_SPEED -> {
@@ -607,7 +657,7 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
                                         val next = baseVolume + (gestureStartY - event.y) / span * (maxVolume - minVolume)
                                         pendingVolume = next.roundToInt().coerceIn(minVolume, maxVolume)
                                         showHint(
-                                            HINT_VOLUME, "音量 $pendingVolume/$maxVolume",
+                                            HINT_VOLUME, "音量 ${volumePercent(pendingVolume)}%",
                                             (pendingVolume - minVolume).toFloat() / (maxVolume - minVolume).coerceAtLeast(1),
                                         )
                                     }
@@ -620,6 +670,14 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
                                 if (mode == MODE_VOLUME && !cancelled) {
                                     audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, pendingVolume, 0)
                                 }
+                                // 横滑：拖动中只做预览，松手才真正跳转
+                                if (mode == MODE_SEEK) {
+                                    if (!cancelled && seekPreviewDuration > 0) {
+                                        player.seekTo(seekPreviewTarget)
+                                        AppLog.i("Player", "seek 提交 ${seekPreviewTarget / 1000}s")
+                                    }
+                                    hint = null
+                                }
                                 // 长按倍率结束：清掉常驻 HUD，并短暂显示控件让用户看到当前倍率胶囊
                                 if (hint?.type == HINT_SPEED) {
                                     hint = null
@@ -629,45 +687,45 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
                                 if (!longPressFired && mode == MODE_NONE && !cancelled) {
                                     val now = SystemClock.uptimeMillis()
                                     val tapSlop = 80f * density
-                                    val isDoubleTap = lastTapMs > 0L &&
-                                        now - lastTapMs < 300L &&
-                                        abs(event.x - lastTapX) < tapSlop &&
-                                        abs(event.y - lastTapY) < tapSlop
                                     // R9：96dp 中心热区内的单击 = 播放/暂停；区外单击 = 切控制条。
                                     val inCenterHot = (view.width > 0 && view.height > 0) &&
                                         abs(event.x - view.width / 2f) <= centerHotPx / 2f &&
                                         abs(event.y - view.height / 2f) <= centerHotPx / 2f
-                                    if (isDoubleTap) {
-                                        // 双击：取消待执行的单击，切播放/暂停（只切一次）
+                                    if (inCenterHot) {
+                                        // 中间区域立刻响应：点正中间想暂停，是最高频的操作，
+                                        // 不该为了等"第二击"硬拖 300ms。双击暂停只在边角区域保留。
                                         singleTapRunnable?.let { handler.removeCallbacks(it) }
                                         singleTapRunnable = null
                                         lastTapMs = 0L
                                         togglePlayPause()
                                         revealControls()
+                                        AppLog.i("Player", "中央按钮 -> playWhenReady=${player.playWhenReady}")
                                     } else {
-                                        // 单击延迟 300ms 执行，给第二击留出判定窗口，避免双击时控件闪一下
-                                        lastTapMs = now
-                                        lastTapX = event.x
-                                        lastTapY = event.y
-                                        val action = Runnable {
+                                        val isDoubleTap = lastTapMs > 0L &&
+                                            now - lastTapMs < 300L &&
+                                            abs(event.x - lastTapX) < tapSlop &&
+                                            abs(event.y - lastTapY) < tapSlop
+                                        if (isDoubleTap) {
+                                            // 双击：取消待执行的单击，切播放/暂停（只切一次）
+                                            singleTapRunnable?.let { handler.removeCallbacks(it) }
                                             singleTapRunnable = null
                                             lastTapMs = 0L
-                                            if (inCenterHot) {
-                                                togglePlayPause()
-                                                revealControls()
-                                                AppLog.i("Player", "中央按钮 -> playWhenReady=${player.playWhenReady}")
-                                            } else {
+                                            togglePlayPause()
+                                            revealControls()
+                                        } else {
+                                            // 单击延迟 300ms 执行，给第二击留出判定窗口，避免双击时控件闪一下
+                                            lastTapMs = now
+                                            lastTapX = event.x
+                                            lastTapY = event.y
+                                            val action = Runnable {
+                                                singleTapRunnable = null
+                                                lastTapMs = 0L
                                                 controlsVisible = !controlsVisible
-                                                if (controlsVisible) {
-                                                    controlsSeq++
-                                                    showController()
-                                                } else {
-                                                    hideController()
-                                                }
+                                                if (controlsVisible) controlsSeq++
                                             }
+                                            singleTapRunnable = action
+                                            handler.postDelayed(action, 300L)
                                         }
-                                        singleTapRunnable = action
-                                        handler.postDelayed(action, 300L)
                                     }
                                 }
                                 true
@@ -791,14 +849,18 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
             }
         }
 
-        // 字幕叠加层（属于视频内容，始终显示）——贴底、字号收小
+        // 字幕叠加层（属于视频内容，始终显示）——贴底、字号可在设置里调
         if (subtitleOn && subtitleText.isNotBlank()) {
+            val subSize = 18f * AppPrefs.subtitleScale
             Text(
                 text = subtitleText,
                 color = Color.White,
-                style = MaterialTheme.typography.bodyLarge,
+                fontSize = subSize.sp,
+                lineHeight = (subSize * 1.35f).sp,
                 textAlign = TextAlign.Center,
                 maxLines = 2,
+                // 长句超过两行时给省略号，而不是硬切掉半个字
+                overflow = TextOverflow.Ellipsis,
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .padding(bottom = 24.dp, start = 48.dp, end = 48.dp)
@@ -807,10 +869,107 @@ fun PlayerScreen(item: VideoItem, onBack: () -> Unit) {
             )
         }
 
+        // ---- 加载 / 缓冲：先转圈，别让人对着黑屏猜 ----
+        if (playError == null && (buffering || !readyOnce)) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .size(56.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(38.dp),
+                    color = Color.White.copy(alpha = 0.85f),
+                    strokeWidth = 3.dp,
+                )
+            }
+        }
+
+        // ---- 播放失败：说清原因，给"重试"和"返回列表" ----
+        playError?.let { err ->
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .padding(horizontal = 32.dp)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Color.Black.copy(alpha = 0.75f))
+                    .padding(horizontal = 24.dp, vertical = 20.dp),
+            ) {
+                Icon(
+                    Icons.Filled.Warning,
+                    contentDescription = null,
+                    tint = Color(0xFFFFC65C),
+                    modifier = Modifier.size(36.dp),
+                )
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    "这个视频无法播放",
+                    color = Color.White,
+                    style = MaterialTheme.typography.titleMedium,
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "文件可能已损坏，或编码格式不被支持。\n${err.errorCodeName}",
+                    color = Color.White.copy(alpha = 0.75f),
+                    style = MaterialTheme.typography.bodySmall,
+                    textAlign = TextAlign.Center,
+                )
+                Spacer(Modifier.height(14.dp))
+                Row(horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(10.dp)) {
+                    Button(onClick = {
+                        playError = null
+                        buffering = true
+                        readyOnce = false
+                        player.prepare()
+                        player.playWhenReady = true
+                        AppLog.i("Player", "重试播放 ${item.name}")
+                    }) { Text("重试") }
+                    TextButton(onClick = onBack) { Text("返回列表", color = Color.White) }
+                }
+            }
+        }
+
         // ---- 手势 HUD：居中胶囊 + 进度条 ----
         val currentHint = hint
         if (currentHint != null) {
             when (currentHint.type) {
+                HINT_SEEK -> {
+                    // 横滑调进度：贴到画面右侧，不要压在视频正中。
+                    // 原来的时间提示是个居中胶囊，横滑时正好盖住画面主体。
+                    Column(
+                        horizontalAlignment = Alignment.End,
+                        modifier = Modifier
+                            .align(Alignment.CenterEnd)
+                            .padding(end = 28.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Color.Black.copy(alpha = 0.62f))
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                    ) {
+                        Text(
+                            text = currentHint.text,
+                            color = Color.White,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Box(
+                            modifier = Modifier
+                                .width(120.dp)
+                                .height(4.dp)
+                                .clip(RoundedCornerShape(2.dp))
+                                .background(Color.White.copy(alpha = 0.2f)),
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxHeight()
+                                    .fillMaxWidth(currentHint.progress)
+                                    .clip(RoundedCornerShape(2.dp))
+                                    .background(Color(0xFF7FB0FF)),
+                            )
+                        }
+                    }
+                }
                 HINT_INFO -> {
                     Text(
                         text = currentHint.text,

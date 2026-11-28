@@ -6,6 +6,8 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
+import com.magplay.data.AppPrefs
 
 // 一套克制的蓝灰配色，替代默认的紫色 Material 主题
 private val LightColors = lightColorScheme(
@@ -42,16 +44,38 @@ private val DarkColors = darkColorScheme(
     outline = Color(0xFF3A3F49),
 )
 
+/**
+ * 主题：跟随系统 / 强制浅色 / 强制深色，由设置页决定（AppPrefs.themeMode）。
+ * 改设置时 AppPrefs 里的状态变化会触发这里重组，不用重启 App。
+ */
 @Composable
 fun MagPlayTheme(content: @Composable () -> Unit) {
-    val colors = if (isSystemInDarkTheme()) DarkColors else LightColors
-    MaterialTheme(colorScheme = colors, content = content)
+    val dark = when (AppPrefs.themeMode) {
+        AppPrefs.THEME_LIGHT -> false
+        AppPrefs.THEME_DARK -> true
+        else -> isSystemInDarkTheme()
+    }
+    MaterialTheme(colorScheme = if (dark) DarkColors else LightColors, content = content)
 }
 
-// 文件类型对应的图标底色 / 前景色（卡片左侧色块）
+/** 当前配色是不是深色底。只用来挑图标底色，跟随 MaterialTheme 而不是跟随系统。 */
+@Composable
+fun isDarkColors(): Boolean = MaterialTheme.colorScheme.background.luminance() < 0.5f
+
+/**
+ * 文件类型对应的图标底色 / 前景色（卡片左侧色块）。
+ * 必须跟主题走：之前写死浅色值，深色模式下这两个色块亮得刺眼。
+ */
 object FileTint {
-    val FOLDER_BG = Color(0xFFFFF1D6)
-    val FOLDER_FG = Color(0xFFE8920C)
-    val VIDEO_BG = Color(0xFFE4E9FF)
-    val VIDEO_FG = Color(0xFF3B5BDB)
+    @Composable
+    fun folderBg(): Color = if (isDarkColors()) Color(0xFF3B2F14) else Color(0xFFFFF1D6)
+
+    @Composable
+    fun folderFg(): Color = if (isDarkColors()) Color(0xFFFFC24B) else Color(0xFFE8920C)
+
+    @Composable
+    fun videoBg(): Color = if (isDarkColors()) Color(0xFF28357A) else Color(0xFFE4E9FF)
+
+    @Composable
+    fun videoFg(): Color = if (isDarkColors()) Color(0xFF9FB4FF) else Color(0xFF3B5BDB)
 }
