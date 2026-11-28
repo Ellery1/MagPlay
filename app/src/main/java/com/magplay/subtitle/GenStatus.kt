@@ -3,6 +3,9 @@ package com.magplay.subtitle
 import android.content.Context
 import org.json.JSONObject
 import java.io.File
+import java.io.RandomAccessFile
+import java.nio.channels.FileChannel
+import java.nio.channels.FileLock
 
 /**
  * 跨进程运行状态快照。
@@ -47,6 +50,64 @@ object GenStatus {
                 tmp.delete()
             }
         } catch (_: Throwable) {
+        }
+    }
+
+    // ---- 跨进程存活锁 ----
+    // status.json 的 running 字段在进程被强杀时会残留，导致 UI 误判"仍在跑"、
+    // 拦住用户 3 分钟。文件锁由内核持有：进程一死锁必然释放，是唯一可靠的存活信号。
+    // 锁文件放 filesDir（应用私有、两进程共享），外部存储可能被卸载或清理。
+
+    private var heldChannel: FileChannel? = null
+    private var heldLock: FileLock? = null
+
+    private fun lockFile(context: Context): File = File(context.filesDir, "subtitle_gen.lock")
+
+    /** 服务进程调用：持有独占锁直到进程死亡或主动 release。 */
+    @Synchronized
+    fun acquireRunLock(context: Context) {
+        releaseRunLock()
+        try {
+            val ch = RandomAccessFile(lockFile(context), "rw").channel
+            val lock = ch.tryLock()
+            if (lock == null) {
+                ch.close()
+            } else {
+                heldChannel = ch
+                heldLock = lock
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    /** 服务进程调用：正常结束时释放，让 UI 立刻知道任务已停。 */
+    @Synchronized
+    fun releaseRunLock() {
+        try { heldLock?.release() } catch (_: Throwable) {}
+        try { heldChannel?.close() } catch (_: Throwable) {}
+        heldLock = null
+        heldChannel = null
+    }
+
+    /**
+     * UI 进程调用：锁被占用说明服务进程真的还活着。
+     * 拿不到/出错一律当"空闲"放行——真正防重复在服务侧 job.isActive，
+     * 这里保守放行只会多一次被服务忽略的请求，不会放行两个并发批次。
+     */
+    @Synchronized
+    fun isRunLocked(context: Context): Boolean {
+        return try {
+            val ch = RandomAccessFile(lockFile(context), "rw").channel
+            val lock = ch.tryLock()
+            if (lock == null) {
+                true
+            } else {
+                try { lock.release() } catch (_: Throwable) {}
+                try { ch.close() } catch (_: Throwable) {}
+                false
+            }
+        } catch (_: Throwable) {
+            false
         }
     }
 

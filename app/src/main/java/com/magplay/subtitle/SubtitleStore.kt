@@ -204,13 +204,12 @@ object SubtitleStore {
     }
 
     /**
-     * 重新生成前清理：把现有字幕备份到私有目录后删除。
-     * 用于"重新生成离线字幕"（先清空全部再全量重做），备份保证可回溯。
+     * 重新生成前清理：直接物理删除现有字幕，不做备份。
+     * UI 在「重新生成」前已经做了二次确认，用户明确接受不可恢复。
      */
     fun clearForRegenerate(context: Context, video: VideoItem): Boolean {
         val old = findSrtUri(context, video) ?: return false
         return try {
-            backupIfInvalid(context, video, old, always = true)
             if (old.scheme == "file") File(old.path!!).delete()
             else context.contentResolver.delete(old, null, null) > 0
         } catch (t: Throwable) {

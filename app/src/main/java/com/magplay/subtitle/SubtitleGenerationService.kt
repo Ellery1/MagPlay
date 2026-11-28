@@ -11,6 +11,7 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
@@ -59,6 +60,15 @@ class SubtitleGenerationService : Service() {
     private var lastStatusAt = 0L
     private var statusText = ""
 
+    /** 本批次启动时刻（elapsedRealtime）。系统 mediaProcessing FGS 24h 内只给 6h。 */
+    private var batchStartedAt = 0L
+
+    /**
+     * 暂停/超时后不再让 finally 把状态覆盖成「批次结束」，
+     * 否则后台自检卡片看不到真正的中断原因。
+     */
+    private var statusFinalized = false
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -72,15 +82,22 @@ class SubtitleGenerationService : Service() {
             }
         }
 
-        // 防重复点击：已有任务在跑则忽略重复 start
-        if (RUNNING.get() || job?.isActive == true) {
+        // 防重复点击只看本进程真实在跑的协程。
+        // 不能拿 RUNNING 当守卫：它是 :subtitle 进程的静态字段，进程被回收后服务重建时
+        // 会残留旧值，导致「点了但没有任何通知」——早上那次就是这么被吞掉的。
+        if (job?.isActive == true) {
             Log.i(TAG, "ignore duplicate start, job still active")
             return START_NOT_STICKY
         }
         val force = intent?.getBooleanExtra(EXTRA_FORCE, false) ?: false
         val onlyId = intent?.getLongExtra(EXTRA_ONLY_ID, -1L) ?: -1L
+        batchStartedAt = SystemClock.elapsedRealtime()
+        statusFinalized = false
         RUNNING.set(true)
         cancelled.set(false)
+        // 内核锁：进程被强杀时由 OS 释放，主进程据此判断"任务是否真在跑"。
+        // 必须在启动协程前拿锁，否则 UI 可能在窗口期误判为空闲。
+        GenStatus.acquireRunLock(this)
         startForegroundCompat(
             buildNotification(
                 when {
@@ -126,15 +143,48 @@ class SubtitleGenerationService : Service() {
     override fun onTimeout(startId: Int, fgsType: Int) {
         fileLog("onTimeout fgsType=$fgsType -> graceful stop")
         cancelled.set(true)
+        statusFinalized = true
         // 立即落盘：超时后进程随时被系统回收，不能等 runBatch 的 finally 慢慢刷状态。
         RUNNING.set(false)
-        publishStatus("已达系统 6 小时上限，已暂停。回到 App 再点一次可继续", force = true)
+        val text = "已达系统 6 小时上限，已暂停。点通知「继续生成」接着跑"
+        publishStatus(text, force = true)
         try {
-            updateNotification("已达系统 6 小时上限，已暂停。回到 App 再点一次可继续", 100, false)
+            updateNotification(text, 100, false, canResume = true)
         } catch (_: Throwable) {
         }
+        // onTimeout 之后服务已不是前台服务，普通 stopSelf 会连带删掉通知。
+        // 先 detach，用户才能看到「为什么停了」以及继续按钮。
+        detachForeground()
         job?.cancel()
         stopSelf()
+    }
+
+    /**
+     * 在 6 小时硬上限前主动收尾。继续跑满会被系统 onTimeout 强停，
+     * 当前视频的半成品也不会写盘，提前停没有数据损失。
+     */
+    private fun pauseBeforeLimit() {
+        if (cancelled.get()) return
+        fileLog("auto pause before 6h FGS limit")
+        cancelled.set(true)
+        statusFinalized = true
+        RUNNING.set(false)
+        val text = "已跑满 5 小时 50 分，自动暂停。点通知「继续生成」接着跑"
+        publishStatus(text, force = true)
+        try {
+            updateNotification(text, 100, false, canResume = true)
+        } catch (_: Throwable) {
+        }
+        detachForeground()
+        job?.cancel()
+        stopSelf()
+    }
+
+    private fun detachForeground() {
+        try {
+            stopForeground(STOP_FOREGROUND_DETACH)
+        } catch (_: Throwable) {
+        }
     }
 
     private fun acquireWakeLock() {
@@ -163,6 +213,12 @@ class SubtitleGenerationService : Service() {
 
     /** 每 60 秒记一次心跳，事后可从 gen.log 判断锁屏期间是否仍在推进。 */
     private fun heartbeat(text: String) {
+        if (batchStartedAt > 0L &&
+            SystemClock.elapsedRealtime() - batchStartedAt >= AUTO_PAUSE_MS
+        ) {
+            pauseBeforeLimit()
+            return
+        }
         val now = System.currentTimeMillis()
         if (now - lastBeatAt < 60_000L) return
         lastBeatAt = now
@@ -177,6 +233,8 @@ class SubtitleGenerationService : Service() {
      * 正常进度 2s 节流（解码进度回调很密），关键节点用 force=true 立刻写。
      */
     private fun publishStatus(text: String = statusText, force: Boolean = false) {
+        // 暂停/超时后，finally 与取消通知不能把原因刷掉
+        if (statusFinalized && text != statusText) return
         val now = System.currentTimeMillis()
         if (!force && now - lastStatusAt < 2_000L) return
         lastStatusAt = now
@@ -217,7 +275,7 @@ class SubtitleGenerationService : Service() {
                 val scanned = VideoScanner.scan(this@SubtitleGenerationService)
                 fileLog("scan: total=${scanned.size} force=$force")
                 if (force) {
-                    // 重新生成：先备份并清空所有已存在的字幕，再全量重做
+                    // 重新生成：直接删除所有已存在的字幕（UI 已二次确认），再全量重做
                     var cleared = 0
                     scanned.forEach {
                         if (SubtitleStore.clearForRegenerate(this@SubtitleGenerationService, it)) cleared++
@@ -460,7 +518,7 @@ class SubtitleGenerationService : Service() {
                 onlyId > 0 -> "没生成字幕 $reasonText"
                 else -> "完成：成功 $succeeded / 失败 $failed / 共 ${pending.size}$trackText$reasonText"
             }
-            updateNotification(msg, 100, false)
+            if (!statusFinalized) updateNotification(msg, 100, false)
             Log.i(TAG, "batch finished: $msg")
             fileLog("batch finished: $msg")
         } finally {
@@ -468,7 +526,7 @@ class SubtitleGenerationService : Service() {
             // 系统超时停服务时进程可能在此之前被回收。状态必须先写，否则用户看到的
             // 永远是超时前一拍的"识别中"，误以为还在跑（实测 11-27 的批量生成就这样）。
             RUNNING.set(false)
-            publishStatus("批次结束", force = true)
+            if (!statusFinalized) publishStatus("批次结束", force = true)
             releaseWakeLock()
             // 无论正常/取消/异常，都释放大模型。
             // 必须 NonCancellable：服务被 stopSelf/onDestroy 取消时，普通 withContext 会直接
@@ -478,10 +536,7 @@ class SubtitleGenerationService : Service() {
             }
             // 关键：结束时把通知从前台服务解绑（DETACH），而不是让它随 stopSelf 一起消失。
             // 否则进度条一闪就没，用户根本不知道到底成没成功；现在它会留在通知栏（可手动滑掉）。
-            try {
-                stopForeground(STOP_FOREGROUND_DETACH)
-            } catch (_: Throwable) {
-            }
+            detachForeground()
             stopSelf()
         }
     }
@@ -490,6 +545,7 @@ class SubtitleGenerationService : Service() {
         super.onDestroy()
         job?.cancel()
         scope.coroutineContext[Job]?.cancel()
+        GenStatus.releaseRunLock()
     }
 
     // ---- 日志：logcat 环形缓冲很短，崩溃后往往抓不到；同时落一份文件日志便于事后定位 ----
@@ -509,7 +565,12 @@ class SubtitleGenerationService : Service() {
     }
 
     // ---- 通知 ----
-    private fun buildNotification(text: String, progress: Int, ongoing: Boolean): Notification {
+    private fun buildNotification(
+        text: String,
+        progress: Int,
+        ongoing: Boolean,
+        canResume: Boolean = false,
+    ): Notification {
         createChannelIfNeeded()
         val openIntent = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
@@ -519,6 +580,10 @@ class SubtitleGenerationService : Service() {
             this, 1, Intent(this, SubtitleGenerationService::class.java).setAction(ACTION_CANCEL),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
+        val resumeIntent = PendingIntent.getService(
+            this, 2, Intent(this, SubtitleGenerationService::class.java).setAction(ACTION_RESUME),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_subtitle)
             .setContentTitle("离线字幕生成")
@@ -526,34 +591,61 @@ class SubtitleGenerationService : Service() {
             .setContentIntent(openIntent)
             .setOngoing(ongoing)
             .setOnlyAlertOnce(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setCategory(Notification.CATEGORY_PROGRESS)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            // LOW 在小米上会被折进「静默通知」，状态栏看不到，用户以为没在生成
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
         if (ongoing) {
             builder.setProgress(100, progress, false)
                 .addAction(android.R.drawable.ic_delete, "取消", cancelIntent)
         }
+        if (canResume) {
+            builder.addAction(android.R.drawable.ic_media_play, "继续生成", resumeIntent)
+        }
         return builder.build()
     }
 
-    private fun updateNotification(text: String, progress: Int, ongoing: Boolean) {
+    private fun updateNotification(
+        text: String,
+        progress: Int,
+        ongoing: Boolean,
+        canResume: Boolean = false,
+    ) {
+        // 识别阶段只刷通知、不走 heartbeat，时限检查必须在这里也做一次。
+        if (ongoing && batchStartedAt > 0L &&
+            SystemClock.elapsedRealtime() - batchStartedAt >= AUTO_PAUSE_MS
+        ) {
+            pauseBeforeLimit()
+            return
+        }
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        nm.notify(NOTIFICATION_ID, buildNotification(text, progress, ongoing))
+        nm.notify(NOTIFICATION_ID, buildNotification(text, progress, ongoing, canResume))
         // 自检卡片跟着通知文案走，省得两处各维护一份状态
-        publishStatus(text)
+        if (!statusFinalized) publishStatus(text)
     }
 
     private fun createChannelIfNeeded() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            val ch = NotificationChannel(CHANNEL_ID, "字幕生成", NotificationManager.IMPORTANCE_LOW)
+            // 旧渠道 subtitle_gen 被 ROM 固定在 LOW（静默、状态栏不显示）。
+            // 同 id 重建改不动 importance，直接换 id 走新渠道。
+            val ch = NotificationChannel(
+                CHANNEL_ID, "字幕生成", NotificationManager.IMPORTANCE_HIGH,
+            ).apply {
+                description = "离线字幕生成进度；暂停后可从通知继续"
+            }
             nm.createNotificationChannel(ch)
         }
     }
 
     companion object {
         private const val TAG = "SubtitleGenService"
-        private const val CHANNEL_ID = "subtitle_gen"
+        private const val CHANNEL_ID = "subtitle_gen_v2"
         private const val NOTIFICATION_ID = 2026
         const val ACTION_CANCEL = "com.magplay.subtitle.CANCEL"
+        const val ACTION_RESUME = "com.magplay.subtitle.RESUME"
+        /** 6h 上限前 10 分钟收尾，留足写盘与 detach 的时间。 */
+        private const val AUTO_PAUSE_MS = 350L * 60 * 1000L
         private const val EXTRA_FORCE = "com.magplay.subtitle.FORCE"
         private const val EXTRA_ONLY_ID = "com.magplay.subtitle.ONLY_ID"
 
@@ -566,7 +658,7 @@ class SubtitleGenerationService : Service() {
         /**
          * 启动批量生成。
          * @param force false = 只为"没有可用字幕"的视频生成（增量补齐）；
-         *              true  = 先备份并清空所有字幕文件，再全量重新生成。
+         *              true  = 直接删除所有字幕文件（不备份），再全量重新生成。
          */
         fun start(context: Context, force: Boolean = false) {
             val intent = Intent(context, SubtitleGenerationService::class.java)

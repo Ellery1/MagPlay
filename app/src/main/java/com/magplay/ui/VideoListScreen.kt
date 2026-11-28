@@ -1,6 +1,9 @@
 package com.magplay.ui
 
+import android.Manifest
 import android.app.Activity
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.SystemClock
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
@@ -98,6 +101,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import com.magplay.data.AppLog
 import com.magplay.data.DirOpResult
 import com.magplay.data.FileOpResult
@@ -110,6 +114,7 @@ import com.magplay.data.VideoRename
 import com.magplay.data.VideoScanner
 import com.magplay.subtitle.GenAttempts
 import com.magplay.subtitle.AsrSettings
+import com.magplay.subtitle.GenStatus
 import com.magplay.subtitle.ModelDownloader
 import com.magplay.subtitle.SubtitleGenerationService
 import com.magplay.subtitle.SubtitleStore
@@ -160,6 +165,11 @@ fun VideoListScreen(
     }
     // 非 null 表示弹了"锁屏继续"引导框，值是本次要启动的 force 标记
     var pendingGenForce by remember { mutableStateOf<Boolean?>(null) }
+    // 系统通知权限弹窗回来后要启动的批次 / 单视频
+    var pendingNotifyForce by remember { mutableStateOf<Boolean?>(null) }
+    var pendingSingleId by remember { mutableStateOf(-1L) }
+    // 目录重命名后按「可见项」恢复滚动位置（目录本身不变，见 doDirRename）
+    var pendingScrollRestore by remember { mutableStateOf<ScrollRestore?>(null) }
     val searching = query.isNotBlank()
 
     // ---- 长按拖拽移动 ----
@@ -221,7 +231,11 @@ fun VideoListScreen(
                             else "已删除 ${result.count} 个视频及字幕",
                             Toast.LENGTH_SHORT,
                         ).show()
-                        currentDir = currentDir.substringBeforeLast("/", "")
+                        // 重命名必须留在原目录：被改的是 currentDir 的子目录，
+                        // 退到父目录是 off-by-one，还会连滚动位置一起丢。
+                        if (dirOp is PendingDirOp.Delete) {
+                            currentDir = currentDir.substringBeforeLast("/", "")
+                        }
                         scope.launch { onRefresh() }
                     }
                     is DirOpResult.NeedPermission ->
@@ -322,6 +336,91 @@ fun VideoListScreen(
         }
     }
 
+    /**
+     * 服务跑在 :subtitle 进程，主进程的静态字段永远是 false，不能用。
+     * 也不能用 status.json 的时间戳：进程被强杀时 running 会残留，得等 3 分钟才失效，
+     * 这期间用户重开 App 点生成会被误拦。
+     * 改用内核文件锁——服务持锁期间为真，进程死亡 OS 立即释放，零等待。
+     */
+    fun isGenBusy(): Boolean = GenStatus.isRunLocked(context)
+
+    val requestNotifyPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        val force = pendingNotifyForce
+        if (force != null) {
+            pendingNotifyForce = null
+            if (isGenBusy()) {
+                Toast.makeText(context, "已有字幕任务在跑，进度见通知栏", Toast.LENGTH_SHORT).show()
+            } else {
+                SubtitleGenerationService.start(context, force = force)
+                Toast.makeText(
+                    context,
+                    if (granted) "已开始后台生成，进度见通知栏"
+                    else "已开始后台生成；通知权限未开，通知栏看不到进度",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+        } else {
+            val id = pendingSingleId
+            pendingSingleId = -1L
+            if (id > 0L) {
+                if (isGenBusy()) {
+                    Toast.makeText(context, "已有字幕任务在跑，进度见通知栏", Toast.LENGTH_SHORT).show()
+                } else {
+                    SubtitleGenerationService.startSingle(context, id)
+                    Toast.makeText(
+                        context,
+                        if (granted) "已开始生成字幕，进度见通知栏"
+                        else "已开始生成字幕；通知权限未开，通知栏看不到进度",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                }
+            }
+        }
+    }
+
+    fun startGeneration(force: Boolean) {
+        if (isGenBusy()) {
+            Toast.makeText(context, "已有字幕任务在跑，进度见通知栏", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(
+                context, Manifest.permission.POST_NOTIFICATIONS,
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingNotifyForce = force
+            requestNotifyPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+            return
+        }
+        SubtitleGenerationService.start(context, force = force)
+        Toast.makeText(
+            context,
+            if (force) "已开始重新生成全部字幕，进度见通知栏"
+            else "已开始后台生成（仅缺失部分），进度见通知栏",
+            Toast.LENGTH_SHORT,
+        ).show()
+    }
+
+    fun startGenSingle(id: Long) {
+        if (isGenBusy()) {
+            Toast.makeText(context, "已有字幕任务在跑，进度见通知栏", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(
+                context, Manifest.permission.POST_NOTIFICATIONS,
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingSingleId = id
+            requestNotifyPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+            return
+        }
+        SubtitleGenerationService.startSingle(context, id)
+        Toast.makeText(context, "已开始生成字幕，进度见通知栏", Toast.LENGTH_SHORT).show()
+    }
+
     fun launchDirPermission(uris: List<android.net.Uri>) {
         val sender = runCatching {
             val resolver = context.contentResolver
@@ -334,37 +433,6 @@ fun VideoListScreen(
             Toast.makeText(context, "当前系统不支持逐次授权，请授予「所有文件访问权限」", Toast.LENGTH_LONG).show()
         } else {
             permLauncher.launch(IntentSenderRequest.Builder(sender).build())
-        }
-    }
-
-    /** R1：目录批量重命名 / 删除。授权不足时走 pendingDirOp，授权回来后重试。 */
-    fun doDirRename(dir: String, newName: String) {
-        when (val r = VideoFiles.renameDir(context, videosState.value, dir, newName)) {
-            is DirOpResult.Ok -> {
-                Toast.makeText(context, "已重命名 ${r.count} 个视频", Toast.LENGTH_SHORT).show()
-                currentDir = currentDir.substringBeforeLast("/", "")
-                scope.launch { onRefresh() }
-            }
-            is DirOpResult.NeedPermission -> {
-                pendingDirOp = PendingDirOp.Rename(dir, newName)
-                launchDirPermission(r.uris)
-            }
-            is DirOpResult.Failed -> Toast.makeText(context, r.message, Toast.LENGTH_LONG).show()
-        }
-    }
-
-    fun doDirDelete(dir: String) {
-        when (val r = VideoFiles.deleteDir(context, videosState.value, dir)) {
-            is DirOpResult.Ok -> {
-                Toast.makeText(context, "已删除 ${r.count} 个视频及字幕", Toast.LENGTH_SHORT).show()
-                currentDir = currentDir.substringBeforeLast("/", "")
-                scope.launch { onRefresh() }
-            }
-            is DirOpResult.NeedPermission -> {
-                pendingDirOp = PendingDirOp.Delete(dir)
-                launchDirPermission(r.uris)
-            }
-            is DirOpResult.Failed -> Toast.makeText(context, r.message, Toast.LENGTH_LONG).show()
         }
     }
 
@@ -530,6 +598,81 @@ fun VideoListScreen(
             SortKey.DURATION -> compareBy { it.durationMs }
         }
         if (ascending) shownVideos.sortedWith(comparator) else shownVideos.sortedWith(comparator.reversed())
+    }
+
+    /**
+     * 快照列表第一个可见项。重命名后文件夹卡片可能因为新名字的字母序换到另一行，
+     * 只保留 index 会让用户看到的内容跑掉；按 key 复位才能保证"原位置"。
+     */
+    fun snapshotScroll(renamedLeaf: String? = null, newName: String? = null): ScrollRestore {
+        val st = dirScrollStates[currentDir]
+        val idx = st?.firstVisibleItemIndex ?: 0
+        val off = st?.firstVisibleItemScrollOffset ?: 0
+        val firstKey = if (idx < childDirs.size) {
+            val leaf = childDirs.getOrNull(idx)
+            when {
+                leaf == null -> null
+                renamedLeaf != null && leaf == renamedLeaf && newName != null -> "dir:$newName"
+                else -> "dir:$leaf"
+            }
+        } else {
+            sorted.getOrNull(idx - childDirs.size)?.id?.toString()
+        }
+        return ScrollRestore(currentDir, firstKey, idx, off)
+    }
+
+    LaunchedEffect(videos) {
+        val restore = pendingScrollRestore ?: return@LaunchedEffect
+        pendingScrollRestore = null
+        if (restore.dir != currentDir) return@LaunchedEffect
+        val st = dirScrollStates.getOrPut(restore.dir) { LazyListState() }
+        val target = restore.firstKey?.let { key ->
+            if (key.startsWith("dir:")) {
+                childDirs.indexOf(key.removePrefix("dir:"))
+            } else {
+                val i = sorted.indexOfFirst { it.id.toString() == key }
+                if (i >= 0) i + childDirs.size else -1
+            }
+        }?.takeIf { it >= 0 } ?: restore.index
+        val max = (childDirs.size + sorted.size - 1).coerceAtLeast(0)
+        if (target != st.firstVisibleItemIndex ||
+            restore.offset != st.firstVisibleItemScrollOffset
+        ) {
+            st.scrollToItem(target.coerceAtMost(max), restore.offset)
+        }
+    }
+
+    /** R1：目录批量重命名 / 删除。授权不足时走 pendingDirOp，授权回来后重试。 */
+    fun doDirRename(dir: String, newName: String) {
+        when (val r = VideoFiles.renameDir(context, videosState.value, dir, newName)) {
+            is DirOpResult.Ok -> {
+                // 关键修复：不改 currentDir。被重命名的 dir 是 currentDir 的子目录，
+                // 之前 substringBeforeLast 让它退回父目录，还顺手换了 LazyListState 的 key。
+                pendingScrollRestore = snapshotScroll(dir.substringAfterLast("/"), newName)
+                Toast.makeText(context, "已重命名 ${r.count} 个视频", Toast.LENGTH_SHORT).show()
+                scope.launch { onRefresh() }
+            }
+            is DirOpResult.NeedPermission -> {
+                pendingDirOp = PendingDirOp.Rename(dir, newName)
+                launchDirPermission(r.uris)
+            }
+            is DirOpResult.Failed -> Toast.makeText(context, r.message, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    fun doDirDelete(dir: String) {
+        when (val r = VideoFiles.deleteDir(context, videosState.value, dir)) {
+            is DirOpResult.Ok -> {
+                Toast.makeText(context, "已删除 ${r.count} 个视频及字幕", Toast.LENGTH_SHORT).show()
+                currentDir = currentDir.substringBeforeLast("/", "")
+                scope.launch { onRefresh() }
+            }
+            is DirOpResult.NeedPermission -> {
+                pendingDirOp = PendingDirOp.Delete(dir)
+                launchDirPermission(r.uris)
+            }
+            is DirOpResult.Failed -> Toast.makeText(context, r.message, Toast.LENGTH_LONG).show()
+        }
     }
 
     Box(
@@ -1056,22 +1199,7 @@ fun VideoListScreen(
                         if (hasSrt) "重新生成这个视频的字幕" else "为这个视频生成字幕",
                     ) {
                         actionTarget = null
-                        requireModel {
-                            if (SubtitleGenerationService.isRunning()) {
-                                Toast.makeText(
-                                    context,
-                                    "已有字幕任务在跑，等它结束或点通知栏的取消",
-                                    Toast.LENGTH_SHORT,
-                                ).show()
-                            } else {
-                                SubtitleGenerationService.startSingle(context, target.id)
-                                Toast.makeText(
-                                    context,
-                                    if (hasSrt) "已开始重新生成，进度见通知栏" else "已开始生成字幕，进度见通知栏",
-                                    Toast.LENGTH_SHORT,
-                                ).show()
-                            }
-                        }
+                        requireModel { startGenSingle(target.id) }
                     }
                     MenuRow(Icons.Filled.Edit, "重命名") {
                         actionTarget = null
@@ -1212,8 +1340,7 @@ fun VideoListScreen(
                     ) {
                         showGenSubtitleDialog = false
                         if (PowerGuard.isIgnoringBatteryOptimizations(context)) {
-                            SubtitleGenerationService.start(context, force = false)
-                            Toast.makeText(context, "已开始后台生成（仅缺失部分）", Toast.LENGTH_SHORT).show()
+                            startGeneration(false)
                         } else {
                             pendingGenForce = false
                         }
@@ -1221,7 +1348,7 @@ fun VideoListScreen(
                     Spacer(Modifier.height(10.dp))
                     GenOptionCard(
                         title = "重新生成",
-                        desc = "先备份并清空全部字幕文件，再对每个视频重新生成。耗时最长，字幕不准/时间轴错乱时用。",
+                        desc = "直接删除全部已有字幕文件（不备份，不可恢复），再对每个视频重新生成。耗时最长，字幕不准/时间轴错乱时用。",
                     ) {
                         showGenSubtitleDialog = false
                         showRegenerateConfirm = true
@@ -1241,16 +1368,15 @@ fun VideoListScreen(
             title = { Text("重新生成全部字幕？") },
             text = {
                 Text(
-                    "将清空当前所有视频的字幕文件（旧文件会先备份到 App 私有目录 backup_srt），" +
-                        "然后逐个重新生成。视频较多、较长时可能跑很久，可在通知栏随时取消。",
+                    "将直接删除当前所有视频已有的字幕文件，不做备份，删除后不可恢复。" +
+                        "确认后逐个重新生成；视频较多、较长时可能跑很久，可在通知栏随时取消。",
                 )
             },
             confirmButton = {
                 TextButton(onClick = {
                     showRegenerateConfirm = false
                     if (PowerGuard.isIgnoringBatteryOptimizations(context)) {
-                        SubtitleGenerationService.start(context, force = true)
-                        Toast.makeText(context, "已开始重新生成全部字幕", Toast.LENGTH_SHORT).show()
+                        startGeneration(true)
                     } else {
                         pendingGenForce = true
                     }
@@ -1291,15 +1417,13 @@ fun VideoListScreen(
                 TextButton(onClick = {
                     pendingGenForce = null
                     PowerGuard.requestIgnoreBatteryOptimizations(context)
-                    SubtitleGenerationService.start(context, force = force)
-                    Toast.makeText(context, "已开始后台生成", Toast.LENGTH_SHORT).show()
+                    startGeneration(force)
                 }) { Text("去设置并开始") }
             },
             dismissButton = {
                 TextButton(onClick = {
                     pendingGenForce = null
-                    SubtitleGenerationService.start(context, force = force)
-                    Toast.makeText(context, "已开始后台生成", Toast.LENGTH_SHORT).show()
+                    startGeneration(force)
                 }) { Text("直接开始") }
             },
         )
@@ -1493,6 +1617,14 @@ private fun formatSize(bytes: Long): String = when {
 
 /** 待系统授权后重试的文件操作：targetDir 为 null 表示删除。 */
 private data class PendingFileOp(val video: VideoItem, val targetDir: String?)
+
+/** 重命名后恢复可见项用：目录 + 首个可见项 key + 原 index/offset。 */
+private data class ScrollRestore(
+    val dir: String,
+    val firstKey: String?,
+    val index: Int,
+    val offset: Int,
+)
 
 /** R1：等待系统授权后重试的目录批量操作。 */
 private sealed interface PendingDirOp {
